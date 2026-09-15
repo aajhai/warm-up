@@ -19,6 +19,7 @@ const { SlackNotifier, redact } = await import("../src/notifications/slack.js");
 const { acquireLock, unlockStoppedProcess } = await import("../src/lock.js");
 const { classifyAccount } = await import("../src/scenario/accountGuard.js");
 const { networkDomWorld, runConnectionBatch } = await import("../src/scenario/linkedinNetwork.js");
+const { feedDomWorld, feedDomHelpers } = await import("../src/scenario/linkedinDom.js");
 const { Optimizer } = await import("../src/optimizer/reviewer.js");
 const { scrollDistance, HumanController, controlNeedsFeedClamp } = await import("../src/human/input.js");
 const { TrustedPointer } = await import("../src/human/trackpad.js");
@@ -576,3 +577,99 @@ test("cancellation during the final gesture cannot be reported as session succes
   assert.equal(result.reason, "Session interrupted by operator");
   assert.equal(result.postsSeen, 6);
 });
+
+function feedWorld(html, rects = {}) {
+  const { document, window } = parseHTML(html);
+  const defaultRect = { x: 300, y: 200, top: 200, bottom: 500, width: 540, height: 300, left: 300, right: 840 };
+  for (const el of document.querySelectorAll("*")) {
+    const key = el.getAttribute("componentkey") || el.id || el.getAttribute("data-rect") || "";
+    const rect = rects[key] || defaultRect;
+    el.getBoundingClientRect = () => ({ ...rect });
+    el.scrollIntoView = function scrollIntoView() {
+      const moved = rects.afterReveal?.[key] || { ...rect, top: 180, bottom: 180 + (rect.height || 300), y: 180 };
+      el.getBoundingClientRect = () => ({ ...moved });
+      for (const child of el.querySelectorAll("*")) {
+        child.getBoundingClientRect = () => ({ ...moved, height: 36, bottom: moved.top + 36, width: 80 });
+      }
+    };
+  }
+  const sandbox = {
+    document,
+    window: { innerHeight: 900, ...(window || {}) },
+    innerHeight: 900,
+    location: { href: "https://www.linkedin.com/feed/", origin: "https://www.linkedin.com" },
+    getComputedStyle: () => ({ visibility: "visible" }),
+    URL,
+  };
+  // feedDomWorld closes over document/window from the page; bind via vm with globals.
+  Object.assign(sandbox, { document, window: sandbox.window });
+  const helpers = vm.runInNewContext(`(${feedDomHelpers.toString()})()`, sandbox);
+  sandbox.helpers = helpers;
+  const world = vm.runInNewContext(`(${feedDomWorld.toString()})(helpers)`, { ...sandbox, helpers, document, window: sandbox.window });
+  return { document, world };
+}
+
+test("modern FeedType listitems are preferred over People You May Know panels", () => {
+  const html = `<!doctype html><html><body>
+    <main>
+      <div data-testid="mainFeed" componentkey="container-update-list_mainFeed-lazy-container" role="list">
+        <div role="listitem" componentkey="pymk-1">
+          People You May Know
+          <button aria-label="Invite Bhavya Sharma to connect">Connect</button>
+          <button aria-label="Invite Sajjan Gill to connect">Connect</button>
+          Discover more
+        </div>
+        <div role="listitem" componentkey="expandedabcFeedType_MAIN_FEED_RELEVANCE" id="expandedabcFeedType_MAIN_FEED_RELEVANCE">
+          Suggested Tahir Ali
+          <button aria-label="Open control menu for post by Tahir Ali"></button>
+          <button aria-label="Reaction button state: no reaction Like">Like</button>
+          <button aria-label="Comment">Comment</button>
+          <button aria-label="Repost">Repost</button>
+          <div role="listitem" componentkey="nested-social">
+            <button aria-label="Reaction button state: no reaction Like">Like</button>
+            <button aria-label="Comment">Comment</button>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body></html>`;
+  const { world } = feedWorld(html, {
+    "expandedabcFeedType_MAIN_FEED_RELEVANCE": { x: 300, y: 1200, top: 1200, bottom: 1600, width: 540, height: 400, left: 300, right: 840 },
+    "nested-social": { x: 300, y: 1500, top: 1500, bottom: 1540, width: 540, height: 40, left: 300, right: 840 },
+    "pymk-1": { x: 300, y: 100, top: 100, bottom: 700, width: 540, height: 600, left: 300, right: 840 },
+    afterReveal: {
+      "expandedabcFeedType_MAIN_FEED_RELEVANCE": { x: 300, y: 180, top: 180, bottom: 580, width: 540, height: 400, left: 300, right: 840 },
+    },
+  });
+  const dump = world.dump();
+  assert.equal(dump.socialPosts, 1);
+  assert.match(dump.firstCard.componentkey, /FeedType_MAIN_FEED_RELEVANCE/);
+  assert.equal(world.collect().length, 0);
+  const revealed = world.collect({ reveal: true });
+  assert.equal(revealed.length, 1);
+  assert.match(revealed[0].urn, /FeedType_MAIN_FEED_RELEVANCE/);
+});
+
+test("blocking modal close control is dismissed before collecting posts", () => {
+  let closed = false;
+  const html = `<!doctype html><html><body>
+    <main>
+      <div data-testid="mainFeed" role="list">
+        <div role="listitem" componentkey="expandedxyzFeedType_MAIN_FEED_RELEVANCE">
+          <button aria-label="Reaction button state: no reaction Like">Like</button>
+          <button aria-label="Comment">Comment</button>
+        </div>
+      </div>
+    </main>
+    <div role="dialog" aria-modal="true"><video></video><button aria-label="Close modal dialog">X</button></div>
+  </body></html>`;
+  const { document, world } = feedWorld(html, {
+    "expandedxyzFeedType_MAIN_FEED_RELEVANCE": { x: 300, y: 160, top: 160, bottom: 520, width: 540, height: 360, left: 300, right: 840 },
+  });
+  const closeBtn = [...document.querySelectorAll("button")].find((b) => /close modal dialog/i.test(b.getAttribute("aria-label") || ""));
+  closeBtn.click = () => { closed = true; };
+  assert.equal(world.dismissBlockingModals(), true);
+  assert.equal(closed, true);
+  assert.equal(world.collect().length, 1);
+});
+

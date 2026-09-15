@@ -167,6 +167,9 @@ export class HumanController {
   async livePosts() {
     if (Date.now() - this.postsCacheAt < 500 && this.postsCache.length) return this.postsCache;
     this.postsCache = await collectPosts(this.page);
+    if (!this.postsCache.length) {
+      this.postsCache = await collectPosts(this.page, { reveal: true });
+    }
     this.postsCacheAt = Date.now();
     return this.postsCache;
   }

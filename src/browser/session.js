@@ -33,16 +33,50 @@ async function discoverProfileDebuggerUrl(profileId) {
   return null;
 }
 
-async function connectWs(wsUrl) {
-  for (let attempt = 1; attempt <= 8; attempt += 1) {
+async function waitForDebuggerHttp(wsUrl, timeoutMs = 45_000) {
+  const endpoint = new URL(wsUrl);
+  endpoint.protocol = "http:";
+  endpoint.pathname = "/json/version";
+  const deadline = Date.now() + timeoutMs;
+  let lastError;
+  while (Date.now() < deadline) {
     try {
-      return await puppeteer.connect({
+      const response = await fetch(endpoint, { signal: AbortSignal.timeout(2_500) });
+      if (response.ok) {
+        const json = await response.json();
+        if (json.webSocketDebuggerUrl) return;
+      }
+      lastError = new Error(`Debugger HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(1_000);
+  }
+  throw new Error(`Orbita debugger was not healthy before connect: ${lastError?.message || "unknown"}`);
+}
+
+async function connectWs(wsUrl) {
+  await waitForDebuggerHttp(wsUrl);
+  // Give Orbita a moment after the debugger port answers — attaching during the
+  // first LinkedIn paint can wedge Network.enable on some local profiles.
+  await sleep(4_000);
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    let browser;
+    try {
+      browser = await puppeteer.connect({
         browserWSEndpoint: wsUrl,
         defaultViewport: null,
-        protocolTimeout: 90_000,
+        protocolTimeout: 120_000,
       });
+      // Probe without waiting the full protocolTimeout if the tab target is wedged.
+      await Promise.race([
+        browser.pages(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("browser.pages probe timed out")), 15_000)),
+      ]);
+      return browser;
     } catch (error) {
       log.warn(`CDP connect attempt ${attempt} failed`, { message: error.message });
+      try { await browser?.disconnect(); } catch { /* ignore */ }
       await sleep(1500 * attempt);
     }
   }

@@ -24,7 +24,7 @@ export const config = {
   timezone: "Asia/Kolkata",
   workStartHour: 9,
   workEndHour: 17,
-  sessionMinutes: { min: 10, max: 15 },
+  sessionMinutes: { min: 10, max: 20 },
   likeRate: { min: 0.02, max: 0.05 },
   likeCapPerSession: 3,
   dailyLikeBudget: 6,

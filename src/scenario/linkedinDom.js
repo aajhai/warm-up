@@ -122,24 +122,76 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return false;
   }
 
+  function feedUpdateKey(el) {
+    return `${el.getAttribute("componentkey") || ""} ${el.id || ""}`;
+  }
+
+  function looksLikeFeedUpdateKey(key) {
+    return /update-card|FeedType_MAIN_FEED|MAIN_FEED_RELEVANCE/i.test(key || "");
+  }
+
+  function hasSocialActionBar(el) {
+    const buttons = [...el.querySelectorAll("button, [role='button']")];
+    const likes = buttons.filter(isLikeControl);
+    const comments = buttons.filter(isCommentControl);
+    if (likes.length && comments.length) return true;
+    const labels = buttons.map(labelOf).join(" ");
+    if (/open control menu for post by/.test(labels)) return true;
+    const text = (el.innerText || "").toLowerCase();
+    return /\bcomment\b/.test(text) && (/\blike\b/.test(text) || /\brepost\b/.test(text) || /reaction button state:/.test(text));
+  }
+
+  function isPeopleYouMayKnowPanel(el) {
+    const text = (el.innerText || "").slice(0, 800).toLowerCase();
+    if (!text) return false;
+    if (hasSocialActionBar(el) || looksLikeFeedUpdateKey(feedUpdateKey(el))) return false;
+    return /people you may know|invite .+ to connect|discover more/.test(text)
+      && !/\breaction button state:|open control menu for post by/.test(text);
+  }
+
+  function cardRoot(el) {
+    let best = el;
+    for (let node = el.parentElement; node && node !== document.body; node = node.parentElement) {
+      const key = feedUpdateKey(node);
+      const role = (node.getAttribute("role") || "").toLowerCase();
+      if (looksLikeFeedUpdateKey(key) || role === "listitem") best = node;
+      if (looksLikeFeedUpdateKey(key)) break;
+    }
+    return best;
+  }
+
+  function postScore(el) {
+    const key = feedUpdateKey(el);
+    let score = 0;
+    if (looksLikeFeedUpdateKey(key)) score += 8;
+    if (hasSocialActionBar(el)) score += 6;
+    if (/open control menu for post by/.test([...el.querySelectorAll("button, [role='button']")].map(labelOf).join(" "))) score += 4;
+    if (isPeopleYouMayKnowPanel(el)) score -= 20;
+    const box = el.getBoundingClientRect?.() || { height: 0, top: 0 };
+    if ((Number(box.height) || 0) >= 80) score += 2;
+    return score;
+  }
+
   function postCards() {
     const root = feedRoot();
-    const keyed = [...root.querySelectorAll('[componentkey^="update-card"], [role="listitem"]')];
+    const keyed = [...root.querySelectorAll(
+      '[componentkey^="update-card"], [componentkey*="FeedType_MAIN_FEED"], [componentkey*="MAIN_FEED_RELEVANCE"], [id*="FeedType_MAIN_FEED"], [id*="MAIN_FEED_RELEVANCE"], [role="listitem"]',
+    )];
     const cards = keyed.filter((el) => {
-      const key = el.getAttribute("componentkey") || el.id || "";
-      if (/update-card/i.test(key)) return true;
-      const text = (el.innerText || "").toLowerCase();
-      return /\bcomment\b/.test(text) && (/\blike\b/.test(text) || /\brepost\b/.test(text));
+      const key = feedUpdateKey(el);
+      if (looksLikeFeedUpdateKey(key)) return !isPeopleYouMayKnowPanel(el);
+      if (isPeopleYouMayKnowPanel(el)) return false;
+      return hasSocialActionBar(el);
     });
     const seen = new Set();
     const unique = [];
     for (const el of cards) {
-      const parentCard = el.closest('[componentkey^="update-card"], [role="listitem"]') || el;
-      if (seen.has(parentCard)) continue;
-      if (parentCard !== el && cards.includes(parentCard)) continue;
-      seen.add(el);
-      unique.push(el);
+      const rootCard = cardRoot(el);
+      if (seen.has(rootCard)) continue;
+      seen.add(rootCard);
+      unique.push(rootCard);
     }
+    unique.sort((a, b) => postScore(b) - postScore(a) || (a.getBoundingClientRect().top - b.getBoundingClientRect().top));
     return unique;
   }
 
@@ -206,38 +258,77 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return null;
   }
 
-  function collect() {
+  function dismissBlockingModals() {
+    let dismissed = false;
+    const buttons = [...document.querySelectorAll("button, [role='button']")];
+    for (const button of buttons) {
+      const label = labelOf(button);
+      if (!/close modal dialog|^dismiss$|^close$/i.test(label)) continue;
+      const r = button.getBoundingClientRect();
+      if (r.width < 8 || r.height < 8) continue;
+      try { button.click(); dismissed = true; } catch { /* ignore */ }
+    }
+    const dialog = document.querySelector("[role='dialog'][aria-modal='true'], [aria-modal='true']");
+    if (dialog) {
+      const closer = [...dialog.querySelectorAll("button, [role='button']")].find((el) => /close modal dialog|close|dismiss/i.test(labelOf(el)));
+      if (closer) {
+        try { closer.click(); dismissed = true; } catch { /* ignore */ }
+      }
+    }
+    return dismissed;
+  }
+
+  function mapPost(el, vh) {
+    const box = el.getBoundingClientRect();
+    const text = (el.innerText || "").replace(/\s+/g, " ").trim();
+    const like = likeControl(el);
+    const more = moreControl(el);
+    const likeBox = like?.button ? like.button.getBoundingClientRect() : null;
+    const moreBox = more ? more.getBoundingClientRect() : null;
+    return {
+      urn: postIdentity(el),
+      top: box.top,
+      height: box.height,
+      midY: box.top + Math.min(Math.max(118, Math.min(box.height, 280) * 0.55), 420),
+      midX: box.left + Math.min(box.width, 560) * 0.42,
+      visible: helpers.readablePostBox(box, vh),
+      promoted: /promoted|sponsored/i.test(text.slice(0, 220)),
+      liked: Boolean(like?.pressed || (like?.label || "").includes("unlike") || (/reaction button state:/.test(like?.label || "") && !/no reaction/.test(like?.label || ""))),
+      hasLike: Boolean(like?.button),
+      hasMore: Boolean(more),
+      likeX: likeBox ? likeBox.x + Math.min(likeBox.width * 0.28, 22) : null,
+      likeY: likeBox ? likeBox.y + likeBox.height * 0.72 : null,
+      moreX: moreBox ? moreBox.x + moreBox.width / 2 : null,
+      moreY: moreBox ? moreBox.y + moreBox.height / 2 : null,
+      textLen: text.length,
+      stable: true,
+      score: postScore(el),
+    };
+  }
+
+  function collect({ reveal = false } = {}) {
+    dismissBlockingModals();
     const vh = helpers.feedViewportHeight(
       window.innerHeight,
       document.documentElement?.clientHeight,
       document.body?.clientHeight,
     );
-    return postCards().map((el) => {
-      const box = el.getBoundingClientRect();
-      const text = (el.innerText || "").replace(/\s+/g, " ").trim();
-      const like = likeControl(el);
-      const more = moreControl(el);
-      const likeBox = like?.button ? like.button.getBoundingClientRect() : null;
-      const moreBox = more ? more.getBoundingClientRect() : null;
-      return {
-        urn: postIdentity(el),
-        top: box.top,
-        height: box.height,
-        midY: box.top + Math.min(Math.max(118, Math.min(box.height, 280) * 0.55), 420),
-        midX: box.left + Math.min(box.width, 560) * 0.42,
-        visible: helpers.readablePostBox(box, vh),
-        promoted: /promoted|sponsored/i.test(text.slice(0, 220)),
-        liked: Boolean(like?.pressed || (like?.label || "").includes("unlike") || (/reaction button state:/.test(like?.label || "") && !/no reaction/.test(like?.label || ""))),
-        hasLike: Boolean(like?.button),
-        hasMore: Boolean(more),
-        likeX: likeBox ? likeBox.x + Math.min(likeBox.width * 0.28, 22) : null,
-        likeY: likeBox ? likeBox.y + likeBox.height * 0.72 : null,
-        moreX: moreBox ? moreBox.x + moreBox.width / 2 : null,
-        moreY: moreBox ? moreBox.y + moreBox.height / 2 : null,
-        textLen: text.length,
-        stable: true,
-      };
-    }).filter((post) => post.visible);
+    let cards = postCards();
+    let mapped = cards.map((el) => mapPost(el, vh));
+    let visible = mapped.filter((post) => post.visible);
+    if (visible.length || !reveal || !cards.length) return visible;
+
+    const ranked = [...cards].sort((a, b) => postScore(b) - postScore(a) || (a.getBoundingClientRect().top - b.getBoundingClientRect().top));
+    const best = ranked[0];
+    try {
+      best.scrollIntoView({ block: "center", inline: "nearest" });
+    } catch {
+      try { best.scrollIntoView(true); } catch { /* ignore */ }
+    }
+    // Re-query after scroll — LinkedIn may remount feed cards.
+    cards = postCards();
+    mapped = cards.map((el) => mapPost(el, vh));
+    return mapped.filter((post) => post.visible);
   }
 
   function findPost(urn) {
@@ -461,7 +552,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return true;
   }
 
-  return { collect, locate, isLiked, inspect, dump, reactionMenuOpen, mediaOverlayOpen, findSeeNewPosts, probe, pointerBounds, align };
+  return { collect, locate, isLiked, inspect, dump, reactionMenuOpen, mediaOverlayOpen, findSeeNewPosts, probe, pointerBounds, align, dismissBlockingModals };
 }
 
 async function runWorld(page, method, ...args) {
@@ -472,8 +563,12 @@ async function runWorld(page, method, ...args) {
   }, feedDomWorld.toString(), feedDomHelpers.toString(), method, args);
 }
 
-export async function collectPosts(page) {
-  return runWorld(page, "collect");
+export async function collectPosts(page, options = {}) {
+  return runWorld(page, "collect", options);
+}
+
+export async function dismissBlockingModals(page) {
+  return runWorld(page, "dismissBlockingModals");
 }
 
 export async function locateControl(page, urn, kind) {

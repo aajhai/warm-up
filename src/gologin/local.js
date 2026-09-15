@@ -67,7 +67,19 @@ export class LocalProfileLauncher {
   async start(profileId) {
     this.profileId = profileId;
     try {
-      const started = await this.request("start", { profileId, sync: true }, 240_000);
+      const started = await this.request("start", {
+        profileId,
+        sync: true,
+        // Best-effort; desktop API may ignore unknown fields. Orbita binary is also wrapped.
+        args: [
+          "--disable-gpu",
+          "--disable-gpu-compositing",
+          "--disable-dev-shm-usage",
+          "--disable-features=Vulkan",
+          "--use-gl=swiftshader",
+          "--enable-unsafe-swiftshader",
+        ],
+      }, 240_000);
       // GoLogin often returns success with an empty wsUrl while Orbita is still
       // binding the debugger. An empty string must not be passed to URL().
       if (started.wsUrl === "") {

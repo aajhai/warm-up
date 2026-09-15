@@ -1,6 +1,16 @@
-export async function foregroundPage(page) {
-  const cdp = await page.createCDPSession();
+export async function foregroundPage(page, { timeoutMs = 8_000 } = {}) {
+  let cdp = null;
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    // Detach immediately so a hung Target/Browser command cannot occupy the
+    // page session and wedge later Runtime.callFunctionOn for protocolTimeout.
+    cdp?.detach().catch(() => {});
+    cdp = null;
+  }, timeoutMs);
+
   try {
+    cdp = await page.createCDPSession();
     try {
       const { targetInfo } = await cdp.send("Target.getTargetInfo");
       const { windowId, bounds } = await cdp.send("Browser.getWindowForTarget", { targetId: targetInfo.targetId });
@@ -13,7 +23,11 @@ export async function foregroundPage(page) {
       // Headless/cloud targets still support bringToFront without window bounds.
     }
     await page.bringToFront();
+  } catch {
+    await page.bringToFront().catch(() => {});
   } finally {
-    await cdp.detach().catch(() => {});
+    settled = true;
+    clearTimeout(timer);
+    await cdp?.detach().catch(() => {});
   }
 }

@@ -54,9 +54,12 @@ export async function runSession({ windowKey } = {}) {
     await flushNotifications();
     controller.signal.throwIfAborted();
     session = await openWarmupBrowser();
-    await sleep(preflight.plan.settleMs);
     controller.signal.throwIfAborted();
+    // Attach to a tab before the long settle — waiting first lets LinkedIn paint
+    // wedge Orbita CDP on some local profiles (Network.enable hangs).
     const page = await getWorkingPage(session.browser);
+    await sleep(Math.min(preflight.plan.settleMs, 4_000));
+    controller.signal.throwIfAborted();
     const result = recordCancellation(await runLinkedInFeed(page, preflight.plan, optimizer, { signal: controller.signal }), controller.signal);
     if (!result.aborted && !preflight.plan.testRun) {
       controller.signal.throwIfAborted();
