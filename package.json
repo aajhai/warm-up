@@ -1,0 +1,32 @@
+{
+  "name": "warm-up",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Human-like LinkedIn home-feed warmup for a GoLogin Orbita profile.",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "once": "node src/index.js once",
+    "once:force": "node src/index.js once --force",
+    "schedule": "node src/index.js schedule",
+    "review": "node src/index.js review",
+    "resolve": "node src/index.js resolve",
+    "status": "node src/index.js status",
+    "notify:test": "node src/index.js notify:test",
+    "notify:flush": "node src/index.js notify:flush",
+    "audit:network": "node src/index.js audit:network",
+    "pause": "node src/index.js pause",
+    "resume": "node src/index.js resume",
+    "unlock": "node src/index.js unlock",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "puppeteer-core": "25.11.0"
+  },
+  "devDependencies": {
+    "linkedom": "^0.18.13"
+  }
+}
