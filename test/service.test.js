@@ -489,7 +489,18 @@ test("local GoLogin starts synchronously, accepts only loopback CDP, and awaits 
   assert.match(await launcher.start("fixture"), /^ws:\/\/127\.0\.0\.1/);
   await launcher.stop();
   assert.equal(launcher.profileId, null);
-  assert.deepEqual(calls.map((c) => c.body), [{ profileId: "fixture", sync: true }, { profileId: "fixture" }]);
+  assert.deepEqual(calls.map((c) => c.body), [{
+    profileId: "fixture",
+    sync: true,
+    args: [
+      "--disable-gpu",
+      "--disable-gpu-compositing",
+      "--disable-dev-shm-usage",
+      "--disable-features=Vulkan",
+      "--use-gl=swiftshader",
+      "--enable-unsafe-swiftshader",
+    ],
+  }, { profileId: "fixture" }]);
   assert.ok(calls.every((c) => c.url.startsWith("http://127.0.0.1:36912/") && c.redirect === "error"));
   for (const wsUrl of ["ws://attacker.invalid/devtools/browser/a", "https://127.0.0.1/devtools/browser/a", "ws://user:pass@127.0.0.1/devtools/browser/a", "ws://127.0.0.1/wrong", undefined]) {
     const invalid = new LocalProfileLauncher({ fetchImpl: async () => Response.json({ status: "success", wsUrl }) });
