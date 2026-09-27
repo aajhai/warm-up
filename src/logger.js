@@ -1,9 +1,12 @@
 import { appendFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { notify, redact } from "./notifications/slack.js";
 
-const logsDir = process.env.WARMUP_LOG_DIR || join(dirname(fileURLToPath(import.meta.url)), "..", "logs");
+// Under `node --test` the repo log is never the default; fixtures must not mix with live runs.
+export const logsDir = process.env.WARMUP_LOG_DIR
+  || (process.env.NODE_TEST_CONTEXT ? join(tmpdir(), `warmup-test-logs-${process.pid}`) : join(dirname(fileURLToPath(import.meta.url)), "..", "logs"));
 mkdirSync(logsDir, { recursive: true });
 const logFile = join(logsDir, "warmup.jsonl");
 

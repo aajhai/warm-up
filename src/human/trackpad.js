@@ -46,6 +46,18 @@ function raceTimeout(promise, timeoutMs, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
+const pagePointers = new WeakMap();
+
+// One pointer per tab, so a Grow or profile click starts where the feed pointer stopped.
+export function pagePointer(page) {
+  let pointer = pagePointers.get(page);
+  if (!pointer) {
+    pointer = new TrustedPointer(page);
+    pagePointers.set(page, pointer);
+  }
+  return pointer;
+}
+
 export class TrustedPointer {
   constructor(page, { commandTimeoutMs = POINTER_COMMAND_TIMEOUT_MS } = {}) {
     this.page = page;
@@ -106,7 +118,7 @@ export class TrustedPointer {
       this.strikes = 0;
     } catch (error) {
       this.strikes += 1;
-      log.warn("Pointer CDP command stalled; abandoning that session instead of waiting for protocolTimeout.", {
+      log.warn("Pointer CDP command stalled; dropping that CDP input session instead of waiting for protocolTimeout.", {
         message: error.message,
         strikes: this.strikes,
       });
@@ -158,32 +170,28 @@ export class TrustedPointer {
     });
   }
 
-  async click() {
+  async click({ holdMs, singlePress = false } = {}) {
     const { x, y } = this.coords();
-    await this.sendWithRetry({
-      type: "mousePressed",
-      x,
-      y,
-      button: "left",
-      buttons: 1,
-      clickCount: 1,
-      modifiers: 0,
-      pointerType: "mouse",
-    });
-    await sleep(randomInt(42, 130));
+    const press = { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1, modifiers: 0, pointerType: "mouse" };
+    const release = { ...press, type: "mouseReleased", buttons: 0 };
+    // A timed-out press may still have reached Orbita. With singlePress it is
+    // never re-sent; the release still goes out so the button is not left held,
+    // and the caller learns the outcome is uncertain.
+    let pressError = null;
+    if (singlePress) {
+      try { await this.dispatch(press); } catch (error) { pressError = error; }
+    } else {
+      await this.sendWithRetry(press);
+    }
+    // LinkedIn treats a slow press/release as a long-press and opens the reaction picker.
+    const hold = Number.isFinite(holdMs) ? holdMs : randomInt(42, 130);
+    await sleep(Math.max(12, hold));
     try {
-      await this.sendWithRetry({
-        type: "mouseReleased",
-        x,
-        y,
-        button: "left",
-        buttons: 0,
-        clickCount: 1,
-        modifiers: 0,
-        pointerType: "mouse",
-      });
+      if (singlePress) await this.dispatch(release);
+      else await this.sendWithRetry(release);
     } catch {
       // Press already went out; do not hang the session on a stuck release.
     }
+    if (pressError) throw pressError;
   }
 }

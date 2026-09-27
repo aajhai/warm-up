@@ -11,6 +11,7 @@ export function emptyState(profile = config) {
     schemaVersion: 2, profileName: profile.profileName, profileId: profile.profileId,
     daily: {}, weekly: {}, actions: [], history: [], currentRun: null,
     lastSession: null, pause: null, optimizerNotes: [], skippedWindows: {}, windows: {},
+    searchQueries: [], visitedUrls: [], inviteHold: null, inviteSignals: [],
   };
 }
 
@@ -33,14 +34,15 @@ export function loadState(profile = config) {
   for (const key of ["daily", "weekly", "windows", "skippedWindows"]) {
     if (!state[key] || typeof state[key] !== "object" || Array.isArray(state[key])) throw new Error(`Invalid ${key} in profile state.`);
   }
-  for (const key of ["actions", "history", "optimizerNotes"]) {
+  for (const key of ["actions", "history", "optimizerNotes", "searchQueries", "visitedUrls", "inviteSignals"]) {
     if (!Array.isArray(state[key])) throw new Error(`Invalid ${key} in profile state.`);
   }
+  if (state.searchQueries.some((q) => typeof q !== "string") || state.visitedUrls.some((u) => typeof u !== "string")) throw new Error("Invalid search or visit history in profile state.");
   for (const day of Object.values(state.daily)) {
     for (const key of ["likes", "sessions", "postsSeen", "aborted"]) {
       if (!Number.isInteger(day[key]) || day[key] < 0) throw new Error(`Invalid daily ${key} count. Refusing to reset activity budgets.`);
     }
-    for (const key of ["connections", "testRuns", "testFailures"]) {
+    for (const key of ["connections", "follows", "testRuns", "testFailures", "infraFailures"]) {
       if (day[key] !== undefined && (!Number.isInteger(day[key]) || day[key] < 0)) throw new Error(`Invalid daily ${key} count.`);
     }
   }
@@ -49,9 +51,10 @@ export function loadState(profile = config) {
     if (!budget || ["cap", "used", "confirmed"].some((key) => !Number.isInteger(budget[key]) || budget[key] < 0) || budget.cap > 100 || budget.confirmed > budget.used) throw new Error("Invalid weekly connection budget. Refusing to reset it.");
   }
   for (const action of state.actions) {
-    if (!action || !["like", "connect"].includes(action.kind) || !["reserved", "confirmed", "unconfirmed"].includes(action.status) || !action.id || !action.runId || !action.key || !validDate(action.at)) throw new Error("Invalid saved action. Manual state review is required.");
+    if (!action || !["like", "connect", "follow"].includes(action.kind) || !["reserved", "confirmed", "unconfirmed", "not_sent"].includes(action.status) || !action.id || !action.runId || !action.key || !validDate(action.at)) throw new Error("Invalid saved action. Manual state review is required.");
   }
   if (state.currentRun && (!state.currentRun.id || !validDate(state.currentRun.at) || !/^\d{4}-\d{2}-\d{2}$/.test(state.currentRun.dayKey) || typeof state.currentRun.testRun !== "boolean")) throw new Error("Invalid unfinished run. Manual state review is required.");
+  if (state.inviteHold && (typeof state.inviteHold !== "object" || !validDate(state.inviteHold.until))) throw new Error("Invalid invite hold. Manual state review is required.");
   if (state.pause && (typeof state.pause !== "object" || !state.pause.reason || (state.pause.cooldownUntil && !validDate(state.pause.cooldownUntil)))) throw new Error("Invalid profile pause. Manual state review is required.");
   if (!saved.schemaVersion && saved.lastSession?.checkpoint) {
     state.pause = { kind: "challenge", reason: "Previous account challenge requires manual review", at: saved.lastSession.at, cooldownUntil: new Date(new Date(saved.lastSession.at).getTime() + 48 * 3600_000).toISOString() };
@@ -69,6 +72,8 @@ export function getDayStats(state, dateKey) {
   if (!state.daily[dateKey]) state.daily[dateKey] = { likes: 0, sessions: 0, postsSeen: 0, aborted: 0, testRuns: 0, connections: 0 };
   const day = state.daily[dateKey];
   day.connections ??= 0;
+  day.follows ??= 0;
   day.testRuns ??= 0;
+  day.infraFailures ??= 0;
   return day;
 }

@@ -85,6 +85,17 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return `${el.getAttribute("aria-label") || ""} ${el.innerText || ""}`.toLowerCase().replace(/\s+/g, " ").trim();
   }
 
+  // LinkedIn paints this load-more control as "See new posts" / "New posts"
+  // (English) or "नई पोस्ट देखें" / "नई पोस्ट" (Hindi). Match the button text
+  // LinkedIn actually renders so a localized feed can still load the next posts.
+  function isLoadMorePostsLabel(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return false;
+    if (/^(see )?new posts$/i.test(text)) return true;
+    if (/^नई पोस्ट( देखें)?$/u.test(text)) return true;
+    return false;
+  }
+
   function feedRoot() {
     return (
       document.querySelector('[data-testid="mainFeed"]') ||
@@ -94,16 +105,27 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     );
   }
 
+  function reactionAlreadyGiven(el) {
+    const label = labelOf(el);
+    return el.getAttribute("aria-pressed") === "true"
+      || /\bunlike\b/.test(label)
+      || (/reaction button state:/.test(label) && !/no reaction/.test(label));
+  }
+
   function isLikeControl(el) {
     if (!el) return false;
     const role = (el.getAttribute("role") || "").toLowerCase();
     if (el.tagName !== "BUTTON" && role !== "button") return false;
     const label = labelOf(el);
     if (!label) return false;
+    // The chevron that opens the emoji picker sits next to Like. Never treat it as Like.
+    if (/open reactions menu/.test(label)) return false;
     if (/comment|repost|share via|\bsend\b|celebrate|insightful|funny|follow|connect|add profile|premium/.test(label)) return false;
-    if (!/\blike\b|\bunlike\b/.test(label)) return false;
+    // Current LinkedIn often labels the toggle "Reaction button state: no reaction 4"
+    // with no "Like" token. Older builds still say "no reaction Like".
+    if (!/\blike\b|\bunlike\b|reaction button state:/.test(label)) return false;
     const r = el.getBoundingClientRect();
-    return r.width >= 24 && r.width <= 220 && r.height >= 16 && r.height <= 64;
+    return r.width >= 24 && r.width <= 280 && r.height >= 16 && r.height <= 64;
   }
 
   function isCommentControl(el) {
@@ -241,7 +263,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       return {
         button: direct,
         label: labelOf(direct),
-        pressed: direct.getAttribute("aria-pressed") === "true" || /unlike/.test(labelOf(direct)) || (/reaction button state:/.test(labelOf(direct)) && !/no reaction/.test(labelOf(direct))),
+        pressed: reactionAlreadyGiven(direct),
       };
     }
     const commentIdx = buttons.findIndex((button) => isCommentControl(button));
@@ -256,6 +278,232 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       };
     }
     return null;
+  }
+
+  function accessibleName(el) {
+    return (el.getAttribute("aria-label") || el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function visibleText(el) {
+    return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isFollowName(name) {
+    const text = String(name || "").replace(/\s+/g, " ").trim();
+    if (!text || text.length > 80 || /following|unfollow/i.test(text)) return false;
+    return /^\+?\s*follow$/i.test(text) || /^follow\s+\S/i.test(text);
+  }
+
+  function isFollowishButton(el) {
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    if (el.tagName !== "BUTTON" && role !== "button") return false;
+    return /\bfollow(ing)?\b|unfollow/i.test(`${el.getAttribute("aria-label") || ""} ${visibleText(el)}`);
+  }
+
+  function isFollowControl(el) {
+    if (!el) return false;
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    if (el.tagName !== "BUTTON" && role !== "button") return false;
+    const aria = el.getAttribute("aria-label") || "";
+    const text = visibleText(el);
+    if (/following|unfollow/i.test(`${aria} ${text}`)) return false;
+    if (el.getAttribute("aria-pressed") === "true") return false;
+    if (!isFollowName(aria || text)) return false;
+    if (aria && text && !isFollowName(text)) return false;
+    if (isLikeControl(el) || isCommentControl(el)) return false;
+    if (el.closest("a, aside, nav, [role='dialog'], [aria-modal='true']")) return false;
+    const r = el.getBoundingClientRect();
+    return r.width >= 24 && r.width <= 240 && r.height >= 16 && r.height <= 56;
+  }
+
+  function personProfileUrl(href) {
+    if (!href) return null;
+    let url;
+    try { url = new URL(href, location.origin); } catch { return null; }
+    if (!/(^|\.)linkedin\.com$/i.test(url.hostname)) return null;
+    const match = url.pathname.match(/^\/in\/([^/?#]+)\/?$/i);
+    return match ? `https://www.linkedin.com/in/${match[1].toLowerCase()}/` : null;
+  }
+
+  // Returns the single person a Follow control belongs to, or null when the
+  // surrounding row names a company, several people, or is not an approved surface.
+  function followContext(button) {
+    const root = feedRoot();
+    if (!root || root === document.body || !root.contains(button)) return null;
+    let row = null;
+    for (let node = button.parentElement, depth = 0; node && node !== root && depth < 8; node = node.parentElement, depth += 1) {
+      const links = [...node.querySelectorAll("a[href]")];
+      const people = new Set(links.map((a) => personProfileUrl(a.getAttribute("href"))).filter(Boolean));
+      const company = links.some((a) => /\/(company|school|showcase)\//i.test(a.getAttribute("href") || ""));
+      if (!people.size && !company) continue;
+      if (company || people.size !== 1) return null;
+      if ([...node.querySelectorAll("button, [role='button']")].filter(isFollowishButton).length !== 1) return null;
+      row = { node, profileUrl: [...people][0] };
+      break;
+    }
+    if (!row) return null;
+
+    for (let node = row.node.parentElement; node && node !== root; node = node.parentElement) {
+      if (hasSocialActionBar(node)) break;
+      const head = visibleText(node).slice(0, 200);
+      if (/recommended for you/i.test(head)) {
+        return {
+          profileUrl: row.profileUrl,
+          source: "recommended",
+          promoted: /promoted|sponsored/i.test(head),
+        };
+      }
+      if ((node.getAttribute("role") || "").toLowerCase() === "listitem" || looksLikeFeedUpdateKey(feedUpdateKey(node))) break;
+    }
+
+    const card = postCards().find((el) => el.contains(button));
+    if (!card) return null;
+    const like = likeControl(card);
+    if (!like?.button || sitsInSocialBar(button)) return null;
+    const br = button.getBoundingClientRect();
+    const cr = card.getBoundingClientRect();
+    const lr = like.button.getBoundingClientRect();
+    if (br.top >= lr.top || br.top - cr.top > 180) return null;
+    return {
+      profileUrl: row.profileUrl,
+      source: "suggested",
+      promoted: /promoted|sponsored/i.test(visibleText(card).slice(0, 220)),
+    };
+  }
+
+  function followButtons() {
+    const root = feedRoot();
+    if (!root || root === document.body) return [];
+    const out = [];
+    const seen = new Set();
+    for (const button of root.querySelectorAll("button, [role='button']")) {
+      if (!isFollowControl(button)) continue;
+      const context = followContext(button);
+      if (!context || context.promoted || seen.has(context.profileUrl)) continue;
+      seen.add(context.profileUrl);
+      out.push({ button, ...context });
+    }
+    return out;
+  }
+
+  function followCandidates() {
+    const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
+    return followButtons()
+      .map(({ button, ...context }) => {
+        const r = button.getBoundingClientRect();
+        return { ...context, label: accessibleName(button), x: r.x + r.width / 2, y: r.y + r.height / 2, top: r.top, bottom: r.top + r.height };
+      })
+      .filter((c) => c.top >= 150 && c.bottom <= vh - 130);
+  }
+
+  function locateFollow(profileUrl) {
+    const match = followButtons().find((c) => c.profileUrl === profileUrl);
+    if (!match) return null;
+    const r = match.button.getBoundingClientRect();
+    const x = r.x + r.width * 0.5;
+    const y = r.y + r.height * 0.5;
+    const hit = hitAt(x, y);
+    if (!hit.el || (hit.el !== match.button && !match.button.contains(hit.el))) return null;
+    if (isProfileHref(hit.href)) return null;
+    return { x, y, label: accessibleName(match.button) };
+  }
+
+  function followState(profileUrl) {
+    const root = feedRoot();
+    for (const button of root.querySelectorAll("button, [role='button']")) {
+      if (!isFollowishButton(button)) continue;
+      const context = followContext(button);
+      if (context?.profileUrl !== profileUrl) continue;
+      const name = `${button.getAttribute("aria-label") || ""} ${visibleText(button)}`;
+      if (/following|unfollow/i.test(name) || button.getAttribute("aria-pressed") === "true") return "following";
+      return "follow";
+    }
+    return "missing";
+  }
+
+  function visitUrl(href) {
+    if (!href) return null;
+    let url;
+    try { url = new URL(href, location.origin); } catch { return null; }
+    if (!/(^|\.)linkedin\.com$/i.test(url.hostname)) return null;
+    const match = url.pathname.match(/^\/(in|company)\/([^/?#]+)\/?$/i);
+    return match ? `https://www.linkedin.com/${match[1].toLowerCase()}/${match[2].toLowerCase()}/` : null;
+  }
+
+  // Profile/company name links that can be opened for a read: the author link in a post
+  // header, and the person name in a "Recommended for you" row. Ads, company rows in that
+  // module, controls, and links without a visible name are excluded.
+  function visitAnchors() {
+    const root = feedRoot();
+    if (!root || root === document.body) return [];
+    const out = [];
+    const seen = new Set();
+    for (const card of postCards()) {
+      const head = visibleText(card).slice(0, 220);
+      if (/promoted|sponsored/i.test(head)) continue;
+      const cr = card.getBoundingClientRect();
+      const anchor = [...card.querySelectorAll("a[href]")].find((a) => {
+        const url = visitUrl(a.getAttribute("href"));
+        if (!url || !visibleText(a) || a.closest("button, [role='button']")) return false;
+        return a.getBoundingClientRect().top - cr.top < 120;
+      });
+      const url = anchor && visitUrl(anchor.getAttribute("href"));
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      out.push({ anchor, url, source: "post", kind: url.includes("/company/") ? "company" : "person" });
+    }
+    for (const button of root.querySelectorAll("button, [role='button']")) {
+      if (!isFollowControl(button)) continue;
+      const context = followContext(button);
+      if (!context || context.source !== "recommended" || context.promoted || seen.has(context.profileUrl)) continue;
+      let anchor = null;
+      for (let node = button.parentElement, depth = 0; node && depth < 8 && !anchor; node = node.parentElement, depth += 1) {
+        anchor = [...node.querySelectorAll("a[href]")].find((a) => personProfileUrl(a.getAttribute("href")) === context.profileUrl && visibleText(a)) || null;
+      }
+      if (!anchor) continue;
+      seen.add(context.profileUrl);
+      out.push({ anchor, url: context.profileUrl, source: "module", kind: "person" });
+    }
+    // Home right rail ("Add to your feed" and similar): name links to the right of the feed
+    // column. The left rail (this account's own card) and promoted blocks are excluded.
+    const feedRight = root.getBoundingClientRect().right;
+    for (const anchor of document.querySelectorAll("a[href]")) {
+      if (root.contains(anchor) || anchor.closest("header, nav, button, [role='button'], [role='dialog'], [role='menu']")) continue;
+      const url = visitUrl(anchor.getAttribute("href"));
+      if (!url || seen.has(url) || !visibleText(anchor)) continue;
+      if (anchor.getBoundingClientRect().left < feedRight - 4) continue;
+      const block = anchor.closest("section, aside, li") || anchor.parentElement;
+      if (/promoted|sponsored/i.test(visibleText(block).slice(0, 240))) continue;
+      seen.add(url);
+      out.push({ anchor, url, source: "home", kind: url.includes("/company/") ? "company" : "person" });
+    }
+    return out;
+  }
+
+  function visitTargets() {
+    const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
+    return visitAnchors().map(({ anchor, ...rest }) => {
+      const r = anchor.getBoundingClientRect();
+      return { ...rest, x: r.x + Math.min(r.width / 2, 50), y: r.y + r.height / 2, top: r.top };
+    }).filter((t) => t.y >= 150 && t.y <= vh - 130);
+  }
+
+  function locateVisit(url) {
+    const match = visitAnchors().find((t) => t.url === url);
+    if (!match) return null;
+    const r = match.anchor.getBoundingClientRect();
+    const x = r.x + Math.min(r.width / 2, 50);
+    const y = r.y + r.height / 2;
+    const hit = hitAt(x, y);
+    if (!hit.el || !match.anchor.contains(hit.el) && hit.el !== match.anchor) return null;
+    return { x, y, label: visibleText(match.anchor).slice(0, 80) };
+  }
+
+  function dialogOpen() {
+    return [...document.querySelectorAll("[role='dialog'], [role='alertdialog'], [aria-modal='true']")].some((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 40 && r.height > 40;
+    });
   }
 
   function dismissBlockingModals() {
@@ -293,11 +541,11 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       midX: box.left + Math.min(box.width, 560) * 0.42,
       visible: helpers.readablePostBox(box, vh),
       promoted: /promoted|sponsored/i.test(text.slice(0, 220)),
-      liked: Boolean(like?.pressed || (like?.label || "").includes("unlike") || (/reaction button state:/.test(like?.label || "") && !/no reaction/.test(like?.label || ""))),
+      liked: Boolean(like?.pressed || (like?.button && reactionAlreadyGiven(like.button))),
       hasLike: Boolean(like?.button),
       hasMore: Boolean(more),
-      likeX: likeBox ? likeBox.x + Math.min(likeBox.width * 0.28, 22) : null,
-      likeY: likeBox ? likeBox.y + likeBox.height * 0.72 : null,
+      likeX: likeBox ? likeBox.x + Math.min(Math.max(10, likeBox.width * 0.18), 18) : null,
+      likeY: likeBox ? likeBox.y + likeBox.height * 0.55 : null,
       moreX: moreBox ? moreBox.x + moreBox.width / 2 : null,
       moreY: moreBox ? moreBox.y + moreBox.height / 2 : null,
       textLen: text.length,
@@ -363,12 +611,14 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     const like = likeControl(post);
     if (!like?.button) return null;
     const r = like.button.getBoundingClientRect();
-    const x = r.x + Math.min(r.width * 0.28, 22);
-    const y = r.y + r.height * 0.72;
+    // Bias left toward the Like label, away from the adjacent reactions-menu chevron.
+    const x = r.x + Math.min(Math.max(10, r.width * 0.18), 18);
+    const y = r.y + r.height * 0.55;
     const hit = hitAt(x, y);
     if (!hit.el) return null;
     if (helpers.isMediaHit(hit.el)) return null;
     if (isProfileHref(hit.href)) return null;
+    if (/open reactions menu/.test(hit.label)) return null;
     const host = hit.el.closest("button, [role='button']");
     if (host !== like.button && !like.button.contains(hit.el) && !isLikeControl(host)) return null;
     return {
@@ -382,8 +632,22 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
   function probe(x, y, kind, urn) {
     const hit = hitAt(x, y);
     if (!hit.el) return { safe: false, reason: "empty" };
+    if (kind === "visit") {
+      if (hit.el.closest("button, [role='button']")) return { safe: false, reason: "control", label: hit.label };
+      const anchor = hit.el.closest("a[href]");
+      if (!anchor || visitUrl(anchor.getAttribute("href")) !== urn) return { safe: false, reason: "different-link", href: hit.href, label: hit.label };
+      if (!visitAnchors().some((t) => t.anchor === anchor)) return { safe: false, reason: "not-approved-link", label: hit.label };
+      return { safe: true, label: hit.label };
+    }
     if (isProfileHref(hit.href)) return { safe: false, reason: "profile-link", href: hit.href, label: hit.label };
     const host = hit.el.closest("button, [role='button']");
+    if (kind === "follow") {
+      if (!isFollowControl(host)) return { safe: false, reason: "not-follow-button", label: hit.label };
+      const context = followContext(host);
+      if (!context || context.promoted) return { safe: false, reason: "not-person-follow", label: hit.label };
+      if (context.profileUrl !== urn) return { safe: false, reason: "different-person", label: hit.label };
+      return { safe: true, label: hit.label };
+    }
     if (urn) {
       const expected = findPost(urn);
       if (!expected || !expected.contains(hit.el)) return { safe: false, reason: "different-post" };
@@ -396,11 +660,11 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       if (helpers.isMediaHit(hit.el)) return { safe: false, reason: "media", label: hit.label };
       if (!isLikeControl(host)) return { safe: false, reason: "not-like-button", label: hit.label };
       if (!sitsInSocialBar(host)) return { safe: false, reason: "not-action-bar", label: hit.label };
-      if (host.getAttribute("aria-pressed") === "true" || /unlike/.test(labelOf(host))) return { safe: false, reason: "already-liked" };
+      if (reactionAlreadyGiven(host)) return { safe: false, reason: "already-liked", label: hit.label };
       return { safe: true, label: hit.label };
     }
     if (kind === "see-new") {
-      if (!/^see new posts$/i.test((host?.innerText || hit.label || "").replace(/\s+/g, " ").trim())) {
+      if (!isLoadMorePostsLabel(host?.innerText || hit.label || "")) {
         return { safe: false, reason: "not-see-new-posts", label: hit.label };
       }
       return { safe: true, label: hit.label };
@@ -432,7 +696,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     const post = findPost(urn);
     if (!post) return false;
     const like = likeControl(post);
-    return Boolean(like?.pressed || (like?.label || "").includes("unlike") || (/reaction button state:/.test(like?.label || "") && !/no reaction/.test(like?.label || "")));
+    return Boolean(like?.pressed || (like?.button && reactionAlreadyGiven(like.button)));
   }
 
   function inspect() {
@@ -521,6 +785,94 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return Boolean(document.querySelector(".media-lightbox, .feed-shared-lightbox, [data-test-id='image-viewer']"));
   }
 
+  function workspaceEl() {
+    return document.querySelector("main#workspace") || document.querySelector("main");
+  }
+
+  function feedListEl() {
+    return document.querySelector('[data-testid="mainFeed"]');
+  }
+
+  function isChromeRow(el) {
+    const text = (el?.innerText || "").replace(/\s+/g, " ").trim();
+    if (!text) return false;
+    if (/^start a post\b/i.test(text) && text.length < 180) return true;
+    if (/^sort by\b/i.test(text) && text.length < 48) return true;
+    if (isLoadMorePostsLabel(text)) return true;
+    return false;
+  }
+
+  function visibleUpdateCount(feed, vh) {
+    if (!feed) return 0;
+    const nodes = [...feed.querySelectorAll("[role='listitem'], [componentkey*='FeedType_MAIN_FEED'], [componentkey^='update-card']")];
+    let count = 0;
+    for (const el of nodes) {
+      if (isChromeRow(el)) continue;
+      const box = el.getBoundingClientRect();
+      if (box.height < 80 || box.width < 180) continue;
+      if (box.bottom < 70 || box.top > vh - 30) continue;
+      count += 1;
+    }
+    return count;
+  }
+
+  function columnState() {
+    const workspace = workspaceEl();
+    const feed = feedListEl();
+    const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
+    const box = feed?.getBoundingClientRect?.() || null;
+    const railText = [...document.querySelectorAll("main aside, #workspace aside")]
+      .reduce((sum, el) => sum + (el.innerText || "").replace(/\s+/g, " ").trim().length, 0);
+    return {
+      top: workspace?.scrollTop || window.scrollY || 0,
+      maxTop: workspace ? Math.max(0, (workspace.scrollHeight || 0) - (workspace.clientHeight || 0)) : 0,
+      windowY: window.scrollY || 0,
+      owner: workspace?.id === "workspace" ? "main#workspace" : "document",
+      feedTop: box ? Math.round(box.top) : null,
+      feedHeight: box ? Math.round(box.height) : 0,
+      feedVisible: Boolean(box && box.height > 40 && box.bottom > 100 && box.top < vh - 40),
+      visibleUpdates: visibleUpdateCount(feed, vh),
+      railText,
+    };
+  }
+
+  function wheelAnchor() {
+    const feed = feedListEl();
+    const box = feed?.getBoundingClientRect?.();
+    const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
+    if (!box || box.width < 80) return null;
+    const x = Math.round(box.left + Math.min(box.width * 0.62, box.width - 28));
+    for (const y of [200, 280, 360, 460]) {
+      if (y < 130 || y > vh - 70) continue;
+      const el = document.elementFromPoint?.(x, y);
+      if (!el) continue;
+      if (el.closest?.("aside, img, video, iframe, canvas, figure, picture, [role='img']")) continue;
+      return { x, y };
+    }
+    return { x, y: Math.max(180, Math.min(360, Math.round(vh * 0.4))) };
+  }
+
+  // LinkedIn paints the rails with position:sticky inside main#workspace and lazy-mounts
+  // updates in [data-testid=mainFeed]. A jump that pushes that short list above the
+  // viewport leaves the rails on screen and the center column blank.
+  function healFeedColumn() {
+    const workspace = workspaceEl();
+    const feed = feedListEl();
+    const before = columnState();
+    if (!workspace || !feed) return { healed: false, ...before };
+    if (before.feedVisible && before.visibleUpdates > 0) return { healed: false, ...before };
+    const box = feed.getBoundingClientRect();
+    const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
+    let next = workspace.scrollTop || 0;
+    if (!before.feedVisible && box.bottom < 140) next = Math.max(0, next - (140 - box.bottom));
+    else if (!before.feedVisible && box.top > vh - 120) next = next + (box.top - 160);
+    else if (before.visibleUpdates === 0 && next > 40) next = Math.max(0, next - Math.min(next, 360));
+    if (!Number.isFinite(next) || Math.abs(next - (workspace.scrollTop || 0)) < 8) return { healed: false, ...before };
+    const from = workspace.scrollTop || 0;
+    workspace.scrollTop = next;
+    return { healed: true, from, to: workspace.scrollTop, ...columnState(), top: workspace.scrollTop };
+  }
+
   function findSeeNewPosts() {
     const vh = helpers.feedViewportHeight(
       window.innerHeight,
@@ -529,7 +881,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     );
     const matches = [...document.querySelectorAll("button, a")].filter((el) => {
       const label = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-      if (!/^see new posts$/i.test(label)) return false;
+      if (!isLoadMorePostsLabel(label)) return false;
       return helpers.seeNewPostsVisible(el.getBoundingClientRect(), vh);
     });
     if (!matches.length) return null;
@@ -552,7 +904,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return true;
   }
 
-  return { collect, locate, isLiked, inspect, dump, reactionMenuOpen, mediaOverlayOpen, findSeeNewPosts, probe, pointerBounds, align, dismissBlockingModals };
+  return { collect, locate, isLiked, inspect, dump, reactionMenuOpen, mediaOverlayOpen, findSeeNewPosts, probe, pointerBounds, align, dismissBlockingModals, columnState, wheelAnchor, healFeedColumn, followCandidates, locateFollow, followState, dialogOpen, visitTargets, locateVisit };
 }
 
 async function runWorld(page, method, ...args) {
@@ -595,6 +947,18 @@ export async function findSeeNewPosts(page) {
   return runWorld(page, "findSeeNewPosts");
 }
 
+export async function readFeedColumn(page) {
+  return runWorld(page, "columnState");
+}
+
+export async function feedWheelAnchor(page) {
+  return runWorld(page, "wheelAnchor");
+}
+
+export async function healFeedColumn(page) {
+  return runWorld(page, "healFeedColumn");
+}
+
 export async function inspectFeed(page) {
   return runWorld(page, "inspect");
 }
@@ -609,4 +973,28 @@ export async function probePoint(page, x, y, kind, urn) {
 
 export async function pointerBounds(page) {
   return runWorld(page, "pointerBounds");
+}
+
+export async function findFollowCandidates(page) {
+  return runWorld(page, "followCandidates");
+}
+
+export async function locateFollow(page, profileUrl) {
+  return runWorld(page, "locateFollow", profileUrl);
+}
+
+export async function followState(page, profileUrl) {
+  return runWorld(page, "followState", profileUrl);
+}
+
+export async function dialogOpen(page) {
+  return runWorld(page, "dialogOpen");
+}
+
+export async function findVisitTargets(page) {
+  return runWorld(page, "visitTargets");
+}
+
+export async function locateVisit(page, url) {
+  return runWorld(page, "locateVisit", url);
 }

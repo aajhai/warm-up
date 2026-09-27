@@ -7,6 +7,8 @@ import { acquireLock } from "./lock.js";
 import { notify, flushNotifications, redact } from "./notifications/slack.js";
 import { createLogger } from "./logger.js";
 import { sleep } from "./util/random.js";
+import { config } from "./config.js";
+import { stopCloudProfile } from "./gologin/cloud.js";
 
 const log = createLogger("service");
 const entrypoint = fileURLToPath(new URL("./index.js", import.meta.url));
@@ -35,7 +37,21 @@ export function planProfiles(profiles, failures, { read = loadState, write = sav
   return jobs.sort((a, b) => a.at - b.at);
 }
 
+// Scheduled workers never inherit a verification request and are marked so config ignores
+// one even if it reappears.
+export function workerEnv(env = process.env) {
+  const { VERIFY_WARMUP: _ignored, ...rest } = env;
+  return { ...rest, TEST_RUN: "false", WARMUP_SCHEDULED_WORKER: "1" };
+}
+
+export function workerArgs(entry, profileId, windowKey) {
+  return [entry, "once", "--profile", profileId, "--window", windowKey];
+}
+
 export async function runService() {
+  if (process.env.VERIFY_WARMUP || process.argv.includes("--verify-warmup")) {
+    log.warn("VERIFY_WARMUP is ignored by the scheduler; scheduled sessions always use the production plan. Use `npm run once` for a verification session.");
+  }
   const release = acquireLock("service");
   let stopping = false;
   let child;
@@ -59,18 +75,27 @@ export async function runService() {
       jobs.sort((a, b) => a.at - b.at);
       const due = jobs.find((job) => job.at.getTime() <= Date.now());
       if (due && !stopping) {
-        await new Promise((resolve, reject) => {
-          child = spawn(process.execPath, [entrypoint, "once", "--profile", due.profile.profileId, "--window", due.key], {
+        const outcome = await new Promise((resolve, reject) => {
+          child = spawn(process.execPath, workerArgs(entrypoint, due.profile.profileId, due.key), {
             stdio: "inherit",
-            env: { ...process.env, TEST_RUN: "false", FORCE_OUTSIDE_HOURS: "false" },
+            env: workerEnv(),
           });
           child.once("error", reject);
           child.once("exit", (code, signal) => {
             if (code !== 0 && !stopping) log.error("Profile worker exited unsuccessfully", { profile: due.profile.profileName, code, signal });
-            resolve();
+            resolve({ code, signal });
           });
         });
         child = null;
+        if ((outcome.code !== 0 || outcome.signal) && config.browserMode === "cloud" && config.stopProfileAfterSession && config.gologinToken) {
+          try {
+            await stopCloudProfile(due.profile.profileId, { token: config.gologinToken });
+            log.info("Stopped cloud profile after an abnormal worker exit", { profile: due.profile.profileName, signal: outcome.signal });
+          } catch (error) {
+            log.error("Could not stop cloud profile after worker exit", { profile: due.profile.profileName, message: error.message });
+            notify("profile_cleanup_failed", error.message, {}, due.profile);
+          }
+        }
       }
       if (!stopping) await sleep(5000);
     }

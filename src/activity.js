@@ -40,20 +40,23 @@ export function alreadyAttempted(state, kind, target) {
 
 export function reserveAction(state, kind, target, { now = new Date(), persist = saveState, limit } = {}) {
   if (!state.currentRun || state.currentRun.testRun || state.pause) throw new Error("Actions require an active, unpaused production run.");
-  if (!["like", "connect"].includes(kind)) throw new Error("Unsupported action.");
+  if (!["like", "connect", "follow"].includes(kind)) throw new Error("Unsupported action.");
   if (!target || alreadyAttempted(state, kind, target)) return null;
   const usedInRun = state.actions.filter((a) => a.runId === state.currentRun.id && a.kind === kind).length;
   if (!Number.isInteger(limit) || limit <= 0 || usedInRun >= limit) return null;
   const local = istNow(now);
-  if (!config.forceOutsideHours && (local.hour < config.workStartHour || local.hour >= config.workEndHour)) return null;
   const dayKey = local.dateKey;
   const day = getDayStats(state, dayKey);
   let week;
   if (kind === "like") {
     if (!config.likesEnabled || day.likes >= config.dailyLikeBudget) return null;
     day.likes += 1;
+  } else if (kind === "follow") {
+    if (!config.followsEnabled || day.follows >= config.follow.dailyBudget) return null;
+    day.follows += 1;
   } else {
     if (!config.connectionsEnabled) return null;
+    if (state.inviteHold && now.getTime() < new Date(state.inviteHold.until).getTime()) return null;
     const budget = weeklyBudget(state, now);
     if (budget.remaining <= 0 || day.connections >= budget.dailyCap) return null;
     week = budget.week;
@@ -67,6 +70,31 @@ export function reserveAction(state, kind, target, { now = new Date(), persist =
   return action.id;
 }
 
+export function normalizeVisitUrl(href) {
+  try {
+    const url = new URL(href, "https://www.linkedin.com");
+    if (!["www.linkedin.com", "linkedin.com"].includes(url.hostname)) return null;
+    const match = url.pathname.match(/^\/(in|company)\/([^/?#]+)/i);
+    return match ? `https://www.linkedin.com/${match[1].toLowerCase()}/${decodeURIComponent(match[2]).toLowerCase()}/` : null;
+  } catch { return null; }
+}
+
+export function alreadyVisited(state, href) {
+  const url = normalizeVisitUrl(href);
+  return !url || (state.visitedUrls || []).includes(url);
+}
+
+// Stored before navigating so a crash mid-visit still prevents a repeat view.
+export function rememberVisit(state, href, persist = saveState) {
+  const url = normalizeVisitUrl(href);
+  if (!url) return false;
+  state.visitedUrls ||= [];
+  if (!state.visitedUrls.includes(url)) state.visitedUrls.push(url);
+  if (state.visitedUrls.length > 5000) state.visitedUrls = state.visitedUrls.slice(-5000);
+  persist(state);
+  return true;
+}
+
 export function finishAction(state, id, confirmed, persist = saveState) {
   const action = state.actions.find((item) => item.id === id);
   if (!action || action.status !== "reserved") throw new Error("Action reservation is missing or already finalized.");
@@ -76,6 +104,21 @@ export function finishAction(state, id, confirmed, persist = saveState) {
   persist(state);
 }
 
+// For a press that LinkedIn refused (limit notice, Connect still offered after reload).
+// The reservation keeps consuming budget, but it is not an uncertain invitation.
+export function finishActionNotSent(state, id, persist = saveState) {
+  const action = state.actions.find((item) => item.id === id);
+  if (!action || action.status !== "reserved") throw new Error("Action reservation is missing or already finalized.");
+  action.status = "not_sent";
+  action.finishedAt = new Date().toISOString();
+  persist(state);
+}
+
+// A connect press that went out with an unknown outcome. "not_sent" and "confirmed" are known.
+export function hasUncertainConnect(state, runId) {
+  return state.actions.some((action) => action.runId === runId && action.kind === "connect" && ["reserved", "unconfirmed"].includes(action.status));
+}
+
 export function beginRun(state, plan, now = new Date(), persist = saveState) {
   if (state.currentRun) throw new Error("Previous run is unfinished; recover it before starting another.");
   if (!plan.testRun) state.enrolledAt ||= now.toISOString();
@@ -83,7 +126,11 @@ export function beginRun(state, plan, now = new Date(), persist = saveState) {
   const day = getDayStats(state, dayKey);
   if (plan.testRun) day.testRuns += 1;
   else day.sessions += 1;
-  state.currentRun = { id: randomUUID(), at: now.toISOString(), dayKey, testRun: Boolean(plan.testRun), connectionTrial: Boolean(plan.connectionTrial) };
+  state.currentRun = {
+    id: randomUUID(), at: now.toISOString(), dayKey, testRun: Boolean(plan.testRun),
+    connectionTrial: Boolean(plan.connectionTrial),
+    progress: { postsSeen: 0, expanded: 0, likes: 0, seeNewPosts: 0 },
+  };
   persist(state);
   return state.currentRun;
 }
@@ -91,13 +138,34 @@ export function beginRun(state, plan, now = new Date(), persist = saveState) {
 export function recoverInterruptedRun(state, persist = saveState) {
   if (!state.currentRun) return false;
   const run = state.currentRun;
-  if (state.actions.some((action) => action.runId === run.id && action.kind === "connect" && action.status !== "confirmed")) {
+  if (hasUncertainConnect(state, run.id)) {
     state.pause ||= { kind: "uncertain_connection", reason: "Interrupted connection attempt requires invitation review", at: new Date().toISOString() };
   }
   const day = getDayStats(state, run.dayKey);
+  const progress = run.progress || {};
+  day.postsSeen += Number.isInteger(progress.postsSeen) ? progress.postsSeen : 0;
   if (run.testRun) day.testFailures = (day.testFailures || 0) + 1;
-  else day.aborted += 1;
-  state.history.push({ ...run, outcome: "interrupted", finishedAt: new Date().toISOString() });
+  else {
+    day.infraFailures = (day.infraFailures || 0) + 1;
+    day.sessions = Math.max(0, day.sessions - 1);
+  }
+  const finishedAt = new Date().toISOString();
+  state.lastSession = {
+    at: finishedAt,
+    dateKey: run.dayKey,
+    likes: progress.likes || 0,
+    postsSeen: progress.postsSeen || 0,
+    expanded: progress.expanded || 0,
+    connections: 0,
+    durationMs: Math.max(0, Date.now() - new Date(run.at).getTime()),
+    aborted: true,
+    checkpoint: false,
+    reason: "Worker process ended before session cleanup",
+    failureKind: "infra",
+    testRun: run.testRun,
+    reasons: {},
+  };
+  state.history.push({ ...run, ...state.lastSession, outcome: "interrupted", finishedAt });
   state.history = state.history.slice(-200);
   state.currentRun = null;
   persist(state);

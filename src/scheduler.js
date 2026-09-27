@@ -2,9 +2,9 @@ import { sleep } from "./util/random.js";
 import { addIstDays, fromIst, istNow } from "./util/time.js";
 
 export const WINDOWS = [
-  { id: "morning", startHour: 9, startMin: 8, endHour: 10, endMin: 25 },
-  { id: "midday", startHour: 12, startMin: 45, endHour: 14, endMin: 5 },
-  { id: "afternoon", startHour: 15, startMin: 20, endHour: 16, endMin: 38 },
+  { id: "overnight", startHour: 0, startMin: 0, endHour: 8, endMin: 0 },
+  { id: "daytime", startHour: 8, startMin: 0, endHour: 16, endMin: 0 },
+  { id: "evening", startHour: 16, startMin: 0, endHour: 24, endMin: 0 },
 ];
 export const LATE_GRACE_MS = 2 * 60_000;
 

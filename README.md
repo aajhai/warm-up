@@ -19,26 +19,24 @@ npm run notify:test
 
 ## Activity defaults
 
-- Feed browsing: 10–15 minutes, three variable windows within 09:00–17:00 IST. Approximately 20% of windows are skipped. Weekends have lighter feed engagement.
+- Feed browsing: 10–20 minutes, three variable windows spread across the full IST day. Approximately 20% of windows are skipped. Weekends have lighter feed engagement.
 - Likes: at most 2–5% of distinct visible posts, three attempts per session, six attempts per IST day. Skip ads, existing reactions, the first posts, and the beginning/end of the session.
 - Connections: a separate batch after successful feed browsing, 2–4 attempts, with pauses and a maximum four-minute batch duration. Requests have no note and come only from recognizable My Network person cards.
 - Weekly connection caps: randomly selected within **30–50**, **50–70**, **70–80**, then **80–100**, with an absolute ceiling of 100.
 - Connection budgets reset **Monday 00:00 UTC**. This is our internal budget policy, not a claim about LinkedIn's actual limits. A lower platform limit always stops activity.
 - A selected cap is saved for the week and never resampled by a restart. Stages advance using completed seven-day periods since the first production run, evaluated at the start of each UTC budget week. An initial partial week therefore does not trigger an immediate stage increase. Tests do not start warm-up age.
 - A daily connection ceiling of `ceil(weekly cap / 7)` spreads activity across IST days. Budgets are ceilings, not targets. Missed activity is not made up later.
-- No comments, follows, messages, reposts, contact uploads, invitations with notes, or automated verification responses.
+- Follows (narrow exception): only person rows in the home-feed "Recommended for you" module and person Suggested/update card headers, never "Following", ads, companies, or "Show more" lists. About 72% of sessions follow nobody, 23% allow at most 1, 5% allow at most 2 (hard cap 2 attempts per session, 3 per IST day). The Recommended module is skipped in 60% of sessions and gives at most one follow. Each person gets one 30% roll, one click, and is deduplicated forever by profile URL. Follows never use the connection budget. Set `FOLLOWS_ENABLED=false` to turn off.
+- No comments, messages, reposts, contact uploads, invitations with notes, Connect from the feed, or automated verification responses.
 
 ## Commands
 
 ```bash
-# One production session during normal work hours
+# One production session at any time
 npm run once -- --profile "Kunal Mittal"
 
 # Short browse-only test at any time: ZERO likes and connection requests
 npm run once:force -- --profile "Kunal Mittal"
-
-# Full production session outside normal hours, with all budgets and stops intact
-npm run once -- --profile "Kunal Mittal" --outside-hours
 
 # Production trial: four minutes browsing, zero likes, at most ONE real invitation
 # Counts toward normal daily/weekly budgets and warm-up age
@@ -58,7 +56,7 @@ npm run notify:flush
 
 Keep `npm run schedule` running in a terminal. It does not install a login item or wake this Mac. While the Mac sleeps, execution stops. Windows missed by more than two minutes are skipped when execution resumes; an active session detects a long heartbeat gap and ends. There are no catch-up bursts. With multiple profiles, conflicting windows may be missed because browsers run sequentially.
 
-The normal feed duration excludes browser startup, notifications, and the additional connection batch. At most three production sessions are attempted per IST day. Two failed production sessions stop further production attempts that day. Browse-only diagnostic failures are tracked separately; profile pauses always block diagnostic runs too.
+The normal feed duration excludes browser startup, notifications, and the additional connection batch. At most 15 production sessions and 15 account-level failed sessions are allowed per IST day. Browser, CDP, deadline, and interrupted-process failures are tracked separately as infrastructure failures and do not consume either production cap. Browse-only diagnostic failures are also tracked separately; profile pauses always block diagnostic runs too.
 
 ## Pause and recovery
 
@@ -69,20 +67,20 @@ npm run pause -- --profile "Kunal Mittal" --reason "Manual maintenance"
 npm run resume -- --profile "Kunal Mittal" --reviewed
 ```
 
-Security challenges and restrictions also require a 48-hour cooldown. Resume cannot bypass that cooldown. A login screen requires manual login and resume. Pausing again does not erase an existing challenge cooldown. Neither test mode nor `--outside-hours` bypasses profile pauses or activity budgets.
+Security challenges and restrictions also require a 48-hour cooldown. Resume cannot bypass that cooldown. A login screen requires manual login and resume. Pausing again does not erase an existing challenge cooldown. Test mode does not bypass profile pauses or activity budgets.
 
-Do not run the same profile manually in GoLogin while this service owns it. The service refuses profiles reported as already running. Locks prevent concurrent local workers. After a forcibly killed process, verify the browser has stopped, then release the stale lock:
+Do not run the same profile manually in GoLogin while this service owns it. The service refuses profiles reported as already running. Locks prevent concurrent local workers. A stale lock is reclaimed automatically only after its recorded PID is confirmed dead. The scheduler also stops an owned cloud profile after an abnormal worker exit; a standalone worker records ownership so its next recovery can stop an orphan. The unlock commands remain available for operator inspection:
 
 ```bash
 npm run unlock -- --lock browser
 npm run unlock -- --lock service
 ```
 
-Unlock refuses if the recorded process is still alive. An uncertain local API launch or failed shutdown also retains the browser lock for inspection. There is deliberately no automatic stale-lock deletion. A malformed lock requires manual inspection.
+Unlock refuses if the recorded process is still alive. An uncertain local API launch or failed shutdown retains the browser lock for inspection, and a malformed lock always requires manual inspection. `SIGKILL` itself cannot execute cleanup code; recovery is performed by the surviving scheduler or the next worker.
 
 ## State and reporting
 
-`data/state-<profile-id>.json` contains daily/weekly budgets, scheduled-window status, current run, recent run history, pauses, and hashed action identities. Writes use a temporary file, flush, and atomic rename. Unreadable state blocks that profile instead of resetting limits; the scheduler continues planning healthy profiles and reports a changed profile error once. Files are local, so preserve `data/` when upgrading or moving the project.
+`data/state-<profile-id>.json` contains daily/weekly budgets, scheduled-window status, current run and its latest feed progress, recent run history, pauses, and hashed action identities. Writes use a temporary file, flush, and atomic rename. Unreadable state blocks that profile instead of resetting limits; the scheduler continues planning healthy profiles and reports a changed profile error once. Files are local, so preserve `data/` when upgrading or moving the project.
 
 Every like and connection attempt reserves budget **before clicking**. Unknown outcomes retain that reservation. Connection recipients are deduplicated per profile across sessions. A connection is considered confirmed only when the same person's card shows Pending. Unexpected dialogs, missing confirmation, or changed controls stop the batch for review. This is conservative: uncertain requests can consume allowance without having been sent.
 

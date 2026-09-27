@@ -6,6 +6,18 @@ function annotate(error, message, retainBrowserLock) {
   return wrapped;
 }
 
+export function responseSnippet(text, token) {
+  let snippet = String(text ?? "").slice(0, 2000).replace(/\s+/g, " ").trim();
+  if (token) snippet = snippet.split(token).join("[redacted]");
+  snippet = snippet
+    .replace(/(authorization["']?\s*[:=]\s*["']?)(?:bearer\s+)?[^\s"',;}]+/gi, "$1[redacted]")
+    .replace(/\bbearer\s+[^\s"',;}]+/gi, "Bearer [redacted]")
+    .replace(/((?:access_|api_|auth_|refresh_)?token["']?\s*[:=]\s*["']?)[^\s"',;&}]+/gi, "$1[redacted]")
+    .replace(/\beyJ[\w-]+\.[\w-]+(?:\.[\w-]+)?/g, "[redacted]")
+    .replace(/\b[A-Za-z0-9_\-+/]{32,}={0,2}/g, "[redacted]");
+  return snippet.slice(0, 200);
+}
+
 export class LocalProfileLauncher {
   constructor({ token, fetchImpl = fetch, now = Date.now, pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
     this.token = token;
@@ -27,7 +39,9 @@ export class LocalProfileLauncher {
     const text = await response.text();
     let json;
     try { json = text ? JSON.parse(text) : {}; }
-    catch { throw new Error(`GoLogin local ${operation} returned an invalid response.`); }
+    catch {
+      throw new Error(`GoLogin local ${operation} returned an invalid response (HTTP ${response.status}): ${JSON.stringify(responseSnippet(text, this.token))}.`);
+    }
     if (!response.ok || json.status === "error" || json.status === "failed") {
       throw new Error(`GoLogin local ${operation} failed (HTTP ${response.status}): ${json.message || json.error || "request rejected"}`);
     }

@@ -53,3 +53,9 @@ export class CloudProfileLauncher {
     this.profileId = null;
   }
 }
+
+export async function stopCloudProfile(profileId, { token, fetchImpl = fetch } = {}) {
+  const launcher = new CloudProfileLauncher({ token, fetchImpl });
+  launcher.profileId = profilePath(profileId);
+  await launcher.stop();
+}

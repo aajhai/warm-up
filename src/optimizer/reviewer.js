@@ -2,8 +2,12 @@ import { config, sampleSessionPlan } from "../config.js";
 import { createLogger } from "../logger.js";
 import { getDayStats } from "../sessionState.js";
 import { reserveAction, finishAction } from "../activity.js";
-import { randomInt } from "../util/random.js";
 import { isWeekendIst, istNow } from "../util/time.js";
+import { inviteHoldReason, loadSharedDay } from "../inviteHold.js";
+
+function loadShared() {
+  try { return loadSharedDay(); } catch { return null; }
+}
 
 const log = createLogger("optimizer");
 
@@ -38,29 +42,19 @@ export class Optimizer {
       plan.connectionTrial = true;
       plan.sessionMs = Math.min(plan.sessionMs, 4 * 60_000);
       plan.likeCap = 0;
+      plan.followCap = 0;
+      Object.assign(plan, { order: ["feed", "grow"], search: false, searchCompany: false, searchConnect: false, inviteCount: 1, feedVisits: 0, growVisits: 0 });
       this.note("Connection trial: short feed session, zero likes, at most one invitation. Normal production budgets apply.");
     }
 
     if (this.state.pause) return { allow: false, reason: `Profile paused: ${this.state.pause.reason}. Manual review and resume required.`, plan };
 
     this.note("Checking activity limits and profile state.");
-
-    const outsideHours = now.hour < config.workStartHour || now.hour >= config.workEndHour;
-    if (outsideHours && !config.forceOutsideHours) {
-      return { allow: false, reason: `Outside IST work window (${config.workStartHour}:00-${config.workEndHour}:00).`, plan };
-    }
-    if (outsideHours && config.forceOutsideHours && config.testRun) {
+    if (config.testRun) {
       plan.testRun = true;
       plan.likeCap = 0;
-      plan.sessionMs = randomInt(150_000, 210_000);
-      plan.warmupMs = randomInt(20_000, 35_000);
-      plan.windDownMs = randomInt(12_000, 22_000);
-      plan.skipFirstPosts = randomInt(4, 7);
-      this.note("Off-hours diagnostic: short browse-only session, zero likes or invitations.");
-    }
-    if (config.testRun && !plan.testRun) {
-      plan.testRun = true;
-      plan.likeCap = 0;
+      plan.followCap = 0;
+      Object.assign(plan, { order: ["feed"], search: false, searchCompany: false, searchConnect: false, inviteCount: 0, feedVisits: 0, growVisits: 0 });
       plan.sessionMs = Math.min(plan.sessionMs, 4 * 60_000);
       this.note("TEST_RUN: shortening the session so this is a pipeline check, not a full day slot.");
     }
@@ -72,11 +66,14 @@ export class Optimizer {
       }
     }
 
-    if (day.aborted >= 2 && !plan.testRun && !config.allowBlockedDay) {
-      return { allow: false, reason: "Two failed production sessions today; further production runs are blocked.", plan };
+    if ((day.infraFailures || 0) >= config.dailyInfraFailureLimit && !plan.testRun && !config.allowBlockedDay) {
+      return { allow: false, reason: `Daily limit of ${config.dailyInfraFailureLimit} infrastructure failures reached; skipping this profile until IST midnight.`, plan };
     }
-    if (day.sessions >= 3 && !plan.testRun && !config.allowBlockedDay) {
-      return { allow: false, reason: "Daily limit of three production sessions reached.", plan };
+    if (day.aborted >= config.dailyFailureLimit && !plan.testRun && !config.allowBlockedDay) {
+      return { allow: false, reason: `Daily limit of ${config.dailyFailureLimit} failed production sessions reached.`, plan };
+    }
+    if (day.sessions >= config.dailySessionLimit && !plan.testRun && !config.allowBlockedDay) {
+      return { allow: false, reason: `Daily limit of ${config.dailySessionLimit} production sessions reached.`, plan };
     }
     if (config.allowBlockedDay && (day.aborted >= 2 || day.sessions >= 3)) {
       this.note("Operator overrode today's session/abort caps. This is not the default safety policy.", {
@@ -111,6 +108,39 @@ export class Optimizer {
       this.note("LIKES_ENABLED=false. Browse only.");
     }
 
+    if (config.verifyWarmupIgnored) {
+      this.note("VERIFY_WARMUP is ignored for scheduled sessions; using the production plan.");
+    }
+    if (config.verifyWarmup && !plan.testRun && !plan.connectionTrial) {
+      Object.assign(plan, {
+        verify: true,
+        order: ["search", "feed", "grow"],
+        search: true,
+        searchCompany: true,
+        searchConnect: true,
+        inviteCount: Math.max(1, plan.inviteCount || 0),
+        feedVisits: Math.max(3, plan.feedVisits || 0),
+        followCap: Math.max(1, plan.followCap || 0),
+        followRecommended: true,
+      });
+      this.note("VERIFY_WARMUP: forcing the verification checklist (company view, profile view, follow if visible, profile connect if exact, Grow invite). Caps still apply.");
+    }
+
+    const followsLeft = Math.max(0, config.follow.dailyBudget - (day.follows || 0));
+    plan.followCap = Math.min(plan.followCap ?? 0, config.follow.hardCapPerSession, followsLeft);
+
+    if (!config.connectionsEnabled) {
+      plan.inviteCount = 0;
+      plan.searchConnect = false;
+    }
+    const hold = inviteHoldReason(this.state, new Date(), loadShared());
+    if (hold && (plan.inviteCount || plan.searchConnect)) {
+      plan.inviteCount = 0;
+      plan.searchConnect = false;
+      this.note("Invites are held for this profile; views and feed browsing continue.", { hold });
+    }
+    if (!plan.inviteCount && !plan.growVisits) plan.order = (plan.order || ["feed"]).filter((step) => step !== "grow");
+
     if (day.sessions === 0) {
       this.note("First session of the day. Do not like the top of the feed. Warm up the scroll first.");
     }
@@ -120,8 +150,18 @@ export class Optimizer {
       likeRate: Number(plan.likeRate.toFixed(3)),
       expandRate: Number(plan.expandRate.toFixed(3)),
       likeCap: plan.likeCap,
+      followCap: plan.followCap,
+      followRecommended: plan.followRecommended,
       skipFirstPosts: plan.skipFirstPosts,
       reverseScrollChance: plan.reverseScrollChance,
+      order: plan.order,
+      search: plan.search,
+      searchCompany: plan.searchCompany,
+      searchConnect: plan.searchConnect,
+      verify: Boolean(plan.verify),
+      inviteCount: plan.inviteCount,
+      feedVisits: plan.feedVisits,
+      growVisits: plan.growVisits,
     });
 
     this.plan = plan;
@@ -176,6 +216,37 @@ export class Optimizer {
     finishAction(this.state, id, confirmed);
   }
 
+  gateFollow({ candidate, stats, elapsedMs, remainingMs, roll = Math.random() }) {
+    const plan = this.plan;
+    if (!plan) return deny("No plan.");
+    const cap = Math.min(plan.followCap ?? 0, config.follow.hardCapPerSession);
+    if (cap <= 0) return deny("This session does not follow anyone.");
+    if ((stats.followAttempts || 0) >= cap) return deny("Session follow cap reached.");
+    if (!candidate?.profileUrl || !/\/in\/[^/]+\/$/.test(candidate.profileUrl)) return deny("Follow target is not a person profile.");
+    if (candidate.promoted) return deny("Do not follow from ads.");
+    if (candidate.source === "recommended") {
+      if (!plan.followRecommended) return deny("Recommended for you module skipped this session.");
+      if ((stats.recommendedFollows || 0) >= 1) return deny("Already followed one person from Recommended for you.");
+    } else if (candidate.source !== "suggested") {
+      return deny("Follow control is not in an approved feed surface.");
+    }
+    if (elapsedMs < plan.warmupMs) return deny("Still in the browsing-only opening period.");
+    if (remainingMs < plan.windDownMs) return deny("Wind-down. No new engagement near session end.");
+    if (stats.lastFollowAt && Date.now() - stats.lastFollowAt < plan.minMsBetweenFollows) return deny("Minimum interval between follows has not elapsed.");
+    if (stats.lastLikeAt && Date.now() - stats.lastLikeAt < 30_000) return deny("Just liked a post.");
+    if (!plan.verify && roll > config.follow.pickChance) return deny("Person was not selected for a follow.");
+    this.note("Allowing one follow.", { source: candidate.source, profileUrl: candidate.profileUrl, attempts: (stats.followAttempts || 0) + 1 });
+    return allow("Passes session cap, surface, warmup, and spacing checks.");
+  }
+
+  reserveFollow(candidate) {
+    return reserveAction(this.state, "follow", candidate.profileUrl, { limit: Math.min(this.plan.followCap, config.follow.hardCapPerSession) });
+  }
+
+  finishFollow(id, confirmed) {
+    finishAction(this.state, id, confirmed);
+  }
+
   postflight(result) {
     const now = istNow();
     const run = this.state.currentRun;
@@ -183,6 +254,10 @@ export class Optimizer {
     day.postsSeen += result.postsSeen;
     if (result.aborted) {
       if (this.plan?.testRun) day.testFailures = (day.testFailures || 0) + 1;
+      else if (result.failureKind === "infra") {
+        day.infraFailures = (day.infraFailures || 0) + 1;
+        day.sessions = Math.max(0, day.sessions - 1);
+      }
       else day.aborted += 1;
     }
 
@@ -191,11 +266,14 @@ export class Optimizer {
       dateKey: now.dateKey,
       likes: result.likes,
       postsSeen: result.postsSeen,
+      expanded: result.expanded || 0,
       durationMs: result.durationMs,
       aborted: result.aborted,
       checkpoint: result.checkpoint,
       connections: result.connections || 0,
+      follows: result.follows || 0,
       reason: result.reason || null,
+      failureKind: result.failureKind || null,
       testRun: Boolean(this.plan?.testRun),
       reasons: result.deniedReasons,
     };

@@ -33,6 +33,11 @@ async function discoverProfileDebuggerUrl(profileId) {
   return null;
 }
 
+function isLocalDebuggerUrl(wsUrl) {
+  const url = new URL(wsUrl);
+  return url.protocol === "ws:" && ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
+}
+
 async function waitForDebuggerHttp(wsUrl, timeoutMs = 45_000) {
   const endpoint = new URL(wsUrl);
   endpoint.protocol = "http:";
@@ -56,23 +61,28 @@ async function waitForDebuggerHttp(wsUrl, timeoutMs = 45_000) {
 }
 
 async function connectWs(wsUrl) {
-  await waitForDebuggerHttp(wsUrl);
-  // Give Orbita a moment after the debugger port answers — attaching during the
-  // first LinkedIn paint can wedge Network.enable on some local profiles.
-  await sleep(4_000);
+  if (isLocalDebuggerUrl(wsUrl)) {
+    await waitForDebuggerHttp(wsUrl);
+    // Give Orbita a moment after the debugger port answers — attaching during the
+    // first LinkedIn paint can wedge Network.enable on some local profiles.
+    await sleep(4_000);
+  }
   for (let attempt = 1; attempt <= 8; attempt += 1) {
     let browser;
     try {
       browser = await puppeteer.connect({
         browserWSEndpoint: wsUrl,
         defaultViewport: null,
-        protocolTimeout: 120_000,
+        // A wedged cloud Runtime.callFunctionOn must fail quickly enough for the
+        // runner to disconnect and stop the owned profile.
+        protocolTimeout: isLocalDebuggerUrl(wsUrl) ? 45_000 : 15_000,
       });
       // Probe without waiting the full protocolTimeout if the tab target is wedged.
       await Promise.race([
         browser.pages(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("browser.pages probe timed out")), 15_000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("browser.pages probe timed out")), isLocalDebuggerUrl(wsUrl) ? 30_000 : 15_000)),
       ]);
+      if (isLocalDebuggerUrl(wsUrl)) await sleep(3_000);
       return browser;
     } catch (error) {
       log.warn(`CDP connect attempt ${attempt} failed`, { message: error.message });

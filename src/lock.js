@@ -13,7 +13,19 @@ export function acquireLock(name, root = directory) {
   try { fd = openSync(path, "wx", 0o600); }
   catch (error) {
     if (error.code !== "EEXIST") throw error;
-    throw new Error(`Another process holds the ${name} lock. If it crashed, use the unlock command after confirming it has stopped.`);
+    let owner;
+    try { owner = JSON.parse(readFileSync(path, "utf8")); }
+    catch { throw new Error(`The ${name} lock is malformed; inspect it manually.`); }
+    if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error(`The ${name} lock is malformed; inspect it manually.`);
+    try { process.kill(owner.pid, 0); }
+    catch (probeError) {
+      if (probeError.code !== "ESRCH") throw probeError;
+      // SIGKILL cannot run finally handlers. Reclaim only a lock whose recorded
+      // owner is definitely gone, then retry the exclusive create once.
+      unlinkSync(path);
+      fd = openSync(path, "wx", 0o600);
+    }
+    if (fd === undefined) throw new Error(`Another process holds the ${name} lock.`);
   }
   try { writeFileSync(fd, JSON.stringify({ pid: process.pid, token, startedAt: new Date().toISOString() })); }
   finally { closeSync(fd); }

@@ -1,7 +1,7 @@
-import { alignControl, collectPosts, locateControl, pointerBounds, probePoint, likeActionBand } from "../scenario/linkedinDom.js";
+import { alignControl, collectPosts, feedWheelAnchor, healFeedColumn, locateControl, pointerBounds, probePoint, likeActionBand, readFeedColumn } from "../scenario/linkedinDom.js";
 import { createLogger } from "../logger.js";
 import { randomFloat, randomInt, sleep, sleepJitter } from "../util/random.js";
-import { trackpadDeltas, TrustedPointer } from "./trackpad.js";
+import { pagePointer, trackpadDeltas } from "./trackpad.js";
 
 const log = createLogger("human");
 
@@ -11,13 +11,13 @@ function bezier(t, p0, p1, p2, p3) {
 }
 
 export function controlNeedsFeedClamp(kind) {
-  return kind !== "like" && kind !== "more" && kind !== "see-new" && kind !== "home";
+  return kind !== "like" && kind !== "more" && kind !== "see-new" && kind !== "home" && kind !== "follow" && kind !== "visit";
 }
 
 export class HumanController {
   constructor(page) {
     this.page = page;
-    this.pointer = new TrustedPointer(page);
+    this.pointer = pagePointer(page);
     this.lastWasReverse = false;
     this.primed = false;
     this.postsCache = [];
@@ -140,10 +140,12 @@ export class HumanController {
     return locate(this.page, urn, kind);
   }
 
-  async clickAt(x, y, kind, urn) {
+  async clickAt(x, y, kind, urn, { shortPress = false, singlePress = false } = {}) {
     try {
       await this.moveTo(x + randomFloat(-1.2, 1.2), y + randomFloat(-1.2, 1.2), { constrainToFeed: controlNeedsFeedClamp(kind) });
-      await sleep(randomInt(70, 220));
+      // Hover dwell on Like opens LinkedIn's reaction flyout; keep likes snappy.
+      const dwell = kind === "like" || shortPress ? randomInt(20, 55) : randomInt(70, 220);
+      await sleep(dwell);
       const hit = await probePoint(this.page, this.pointer.x, this.pointer.y, kind, urn);
       if (!hit?.safe) {
         log.warn("Refusing click. Pointer is not on a safe control.", {
@@ -156,7 +158,10 @@ export class HumanController {
         });
         return false;
       }
-      await this.pointer.click();
+      await this.pointer.click({
+        holdMs: kind === "like" || shortPress ? randomInt(18, 45) : undefined,
+        singlePress,
+      });
       return true;
     } catch (error) {
       log.warn("Click failed.", { kind, message: error.message });
@@ -189,26 +194,22 @@ export class HumanController {
   async scrollOffset() {
     const posts = await this.livePosts();
     const first = posts[0];
-    const metrics = await this.page.evaluate(({ x, y }) => {
-      const scrollable = (node) => {
-        if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
-        const style = getComputedStyle(node);
-        return /auto|scroll|overlay/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 2;
-      };
-      let root = document.elementFromPoint(x, y);
-      while (root && !scrollable(root)) root = root.parentElement;
-      const main = document.querySelector("main");
-      if (!root && scrollable(main)) root = main;
-      if (!root) root = document.scrollingElement || document.documentElement;
+    // Measure main#workspace itself. elementFromPoint walks into document viewers
+    // and carousels, which are not the feed scroller.
+    const metrics = await this.page.evaluate(() => {
+      const root = document.querySelector("main#workspace")
+        || document.querySelector("main")
+        || document.scrollingElement
+        || document.documentElement;
       return {
-        top: root.scrollTop,
-        maxTop: Math.max(0, root.scrollHeight - root.clientHeight),
-        windowY: window.scrollY,
-        owner: root === document.scrollingElement
-          ? "document"
-          : `${root.tagName.toLowerCase()}${root.id ? `#${root.id}` : ""}`,
+        top: root.scrollTop || 0,
+        maxTop: Math.max(0, (root.scrollHeight || 0) - (root.clientHeight || 0)),
+        windowY: window.scrollY || 0,
+        owner: root.id === "workspace"
+          ? "main#workspace"
+          : (root === document.scrollingElement ? "document" : root.tagName.toLowerCase()),
       };
-    }, this.pointer.coords());
+    });
     return {
       ...metrics,
       firstTop: first ? Math.round(first.top) : null,
@@ -244,14 +245,46 @@ export class HumanController {
   }
 
   async scrollFeed({ reverseChance = 0.05, forceReverse = false } = {}) {
-    await this.ensureOverFeed();
+    const livePage = typeof this.page.url === "function";
+    if (livePage) {
+      const column = await readFeedColumn(this.page);
+      // Rails stay sticky while the lazy feed list scrolls off. Wheeling then
+      // only spins a blank center column.
+      if (column && (!column.feedVisible || column.visibleUpdates === 0)) {
+        const healed = await healFeedColumn(this.page);
+        if (healed?.healed) {
+          await sleep(320);
+          return {
+            reverse: false,
+            moved: Math.abs((healed.to || 0) - (healed.from || 0)),
+            ticks: 0,
+            before: column,
+            after: healed,
+            fallback: false,
+            healed: true,
+          };
+        }
+      }
+      if (column?.feedVisible && column.visibleUpdates === 0) {
+        await sleep(400);
+        return { reverse: false, moved: 0, ticks: 0, before: column, after: column, fallback: false, held: true };
+      }
+      const anchor = await feedWheelAnchor(this.page);
+      if (anchor) await this.moveTo(anchor.x, anchor.y, { constrainToFeed: false });
+      else await this.ensureOverFeed();
+    } else {
+      await this.ensureOverFeed();
+      await this.followContent();
+    }
+    const before = await this.scrollOffset();
     let reverse = forceReverse || Math.random() < reverseChance;
     if (!forceReverse && reverse && this.lastWasReverse) reverse = false;
+    if (!forceReverse && !reverse && before.maxTop > 200 && before.top >= before.maxTop - 8) reverse = true;
     this.lastWasReverse = reverse;
     const sign = reverse ? -1 : 1;
-    await this.followContent();
-    const before = await this.scrollOffset();
-    const deltas = trackpadDeltas(sign * randomInt(280, 720));
+    // One short wheel. A 400–700px jump unmounts LinkedIn's lazy update list
+    // before the next cards paint, which is the blank center column.
+    const deltas = trackpadDeltas(sign * randomInt(140, 240));
 
     // Orbita becomes unreliable when one gesture is split into dozens of CDP
     // commands. Keep the pointer stationary and dispatch the full burst once.
@@ -263,7 +296,7 @@ export class HumanController {
     let moved = 0;
     let lastTop = before.top;
     let stableReads = 0;
-    const deadline = Date.now() + 2200;
+    const deadline = Date.now() + 700;
     do {
       await sleep(80);
       this.postsCacheAt = 0;
@@ -273,7 +306,35 @@ export class HumanController {
       else stableReads = 0;
       lastTop = after.top;
     } while ((moved === 0 || stableReads < 2) && Date.now() < deadline);
-    return { reverse, moved, ticks: deltas.length, before, after };
+
+    let fallback = false;
+    if (moved === 0 && typeof this.page.evaluate === "function") {
+      // Cloud Orbita occasionally acknowledges Input.dispatchMouseEvent without
+      // delivering the wheel. Use one bounded DOM scroll as a recovery gesture.
+      await this.page.evaluate(({ deltaY }) => {
+        const root = document.querySelector("main#workspace")
+          || document.querySelector("main")
+          || document.scrollingElement
+          || document.documentElement;
+        root.scrollTop += deltaY;
+      }, { deltaY: deltas.reduce((sum, delta) => sum + delta, 0) });
+      fallback = true;
+      await sleep(120);
+      this.postsCacheAt = 0;
+      after = await this.scrollOffset();
+      moved = scrollDistance(before, after);
+    }
+    if (livePage && moved !== 0) {
+      const column = await readFeedColumn(this.page);
+      if (column && !column.feedVisible) {
+        const healed = await healFeedColumn(this.page);
+        if (healed?.healed) {
+          await sleep(320);
+          return { reverse, moved, ticks: deltas.length, before, after: { ...after, ...healed }, fallback, healed: true };
+        }
+      }
+    }
+    return { reverse, moved, ticks: deltas.length, before, after, fallback };
   }
 
   async idle() {

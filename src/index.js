@@ -47,7 +47,7 @@ export async function main(args = process.argv.slice(2)) {
     console.log(JSON.stringify(await resolveWarmupProfile(), null, 2));
   } else if (command === "review") {
     const { config, sampleSessionPlan } = await import("./config.js");
-    console.log(JSON.stringify({ profile, defaults: { sessionMinutes: config.sessionMinutes, workHoursIST: "09:00–17:00", connectionWeeklyRanges: config.connectionWeeklyRanges, reset: config.connectionWeekReset, connectionBatchRange: config.connectionBatchRange, connectionsEnabled: config.connectionsEnabled }, samplePlan: sampleSessionPlan() }, null, 2));
+    console.log(JSON.stringify({ profile, defaults: { sessionMinutes: config.sessionMinutes, scheduling: "any time", dailySessionLimit: config.dailySessionLimit, dailyFailureLimit: config.dailyFailureLimit, dailyInfraFailureLimit: config.dailyInfraFailureLimit, connectionWeeklyRanges: config.connectionWeeklyRanges, reset: config.connectionWeekReset, growInviteOdds: config.growInviteOdds, connectionsEnabled: config.connectionsEnabled }, samplePlan: sampleSessionPlan() }, null, 2));
   } else if (command === "pause" || command === "resume") {
     const { acquireLock } = await import("./lock.js");
     const { loadState, saveState } = await import("./sessionState.js");
