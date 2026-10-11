@@ -71,13 +71,28 @@ export async function main(args = process.argv.slice(2)) {
     if (!profile.enabled) throw new Error("This profile is disabled in the registry.");
     const { runSession } = await import("./runner.js");
     const result = await runSession({ windowKey: option(args, "--window") });
-    if (result.blocked) console.log(`Session blocked: ${result.reason}`);
-    if (result.result?.aborted) process.exitCode = 1;
+    if (result.deferred) {
+      // The batch runner keys on this line: no browser opened and nothing was counted.
+      console.log(`Session deferred: ${result.reason}`);
+      process.exitCode = EXIT_DEFERRED;
+    } else if (result.blocked) console.log(`Session blocked: ${result.reason}`);
+    if (result.result?.aborted) {
+      console.log(`Session failure kind: ${sessionFailureKind(result.result)}`);
+      process.exitCode = 1;
+    }
   }
+}
+
+export const EXIT_DEFERRED = 75;
+
+export function sessionFailureKind(result) {
+  if (result?.accountBlock) return "account";
+  return result?.failureKind || "scenario";
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
+    if (error?.sessionFailureKind) console.log(`Session failure kind: ${error.sessionFailureKind}`);
     console.error(redact(error.message));
     try { notify("command_failed", error.message); } catch { /* filesystem failure already reported */ }
     process.exitCode = 1;

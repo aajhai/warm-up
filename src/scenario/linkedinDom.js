@@ -97,12 +97,13 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
   }
 
   function feedRoot() {
-    return (
-      document.querySelector('[data-testid="mainFeed"]') ||
-      document.querySelector('[componentkey*="container-update-list"]') ||
-      document.querySelector("main") ||
-      document.body
-    );
+    const found = document.querySelector?.('[data-testid="mainFeed"]')
+      || document.querySelector?.('[componentkey*="container-update-list"]')
+      || document.querySelector?.("main")
+      || document.body
+      || null;
+    if (!found || typeof found.querySelectorAll !== "function") return null;
+    return found;
   }
 
   function reactionAlreadyGiven(el) {
@@ -171,10 +172,21 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       && !/\breaction button state:|open control menu for post by/.test(text);
   }
 
+  // A suggestions insert can carry a feed component key and still not be a post.
+  // Keep a real update that has a like/comment bar even if its text mentions suggestions.
+  function isSuggestionModule(el) {
+    if (!el || hasSocialActionBar(el)) return false;
+    const text = (el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 280);
+    if (!text) return false;
+    return /suggestions for you|suggested for you|people you may know|आपके लिए सुझाव|recommendations for you/i.test(text);
+  }
+
+  // Comment wrappers carry a feed key too; the climb passes them and stops at the post.
   function cardRoot(el) {
     let best = el;
     for (let node = el.parentElement; node && node !== document.body; node = node.parentElement) {
       const key = feedUpdateKey(node);
+      if (isPostSubcomponentKey(key)) continue;
       const role = (node.getAttribute("role") || "").toLowerCase();
       if (looksLikeFeedUpdateKey(key) || role === "listitem") best = node;
       if (looksLikeFeedUpdateKey(key)) break;
@@ -196,10 +208,13 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
 
   function postCards() {
     const root = feedRoot();
+    if (!root) return [];
     const keyed = [...root.querySelectorAll(
       '[componentkey^="update-card"], [componentkey*="FeedType_MAIN_FEED"], [componentkey*="MAIN_FEED_RELEVANCE"], [id*="FeedType_MAIN_FEED"], [id*="MAIN_FEED_RELEVANCE"], [role="listitem"]',
     )];
     const cards = keyed.filter((el) => {
+      if (isPostSubcomponentKey(feedUpdateKey(el)) || insideSubcomponent(el)) return false;
+      if (isSuggestionModule(el)) return false;
       const key = feedUpdateKey(el);
       if (looksLikeFeedUpdateKey(key)) return !isPeopleYouMayKnowPanel(el);
       if (isPeopleYouMayKnowPanel(el)) return false;
@@ -209,17 +224,50 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     const unique = [];
     for (const el of cards) {
       const rootCard = cardRoot(el);
+      if (isPostSubcomponentKey(feedUpdateKey(rootCard))) continue;
       if (seen.has(rootCard)) continue;
       seen.add(rootCard);
       unique.push(rootCard);
     }
     unique.sort((a, b) => postScore(b) - postScore(a) || (a.getBoundingClientRect().top - b.getBoundingClientRect().top));
-    return unique;
+    const identities = new Set();
+    return unique.filter((el) => {
+      const id = postIdentity(el);
+      if (identities.has(id)) return false;
+      identities.add(id);
+      return true;
+    });
+  }
+
+  // Comment sections and inline comment boxes carry the post's feed key with a prefix or a
+  // suffix. They are parts of a post, never a post of their own.
+  function isPostSubcomponentKey(key) {
+    return /commentsSection|CommentBox/.test(key || "");
+  }
+
+  // The post URN can sit before the marker ("<urn>-asyncInlineCommentBoxSlot0_x") or after it
+  // ("<prefix>-asyncInlineCommentBoxSlot<urn>"). Take the last segment that holds a feed URN.
+  // A comment inside a comment box or section is never a post of its own.
+  function insideSubcomponent(el) {
+    for (let node = el.parentElement; node && node !== document.body; node = node.parentElement) {
+      if (isPostSubcomponentKey(feedUpdateKey(node))) return true;
+    }
+    return false;
+  }
+
+  function basePostKey(key) {
+    const parts = String(key || "").split(/-?asyncInlineCommentBoxSlot|commentsSectionContainer/);
+    for (let i = parts.length - 1; i >= 0; i -= 1) {
+      const stripped = parts[i].replace(/^(?:expanded|update-card-focus)+/, "");
+      const base = stripped.match(/^(.*?FeedType_[A-Z_]+)/);
+      if (base) return base[1];
+    }
+    return String(key || "").replace(/^(?:expanded|update-card-focus)+/, "");
   }
 
   function postIdentity(el) {
     const key = el.getAttribute("componentkey") || el.id || "";
-    if (key) return key;
+    if (key) return basePostKey(key);
     const named = el.querySelector("[data-urn], [data-id^='urn:li']");
     if (named) return named.getAttribute("data-urn") || named.getAttribute("data-id");
     return `t:${(el.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80)}`;
@@ -386,6 +434,240 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return out;
   }
 
+  function organizationUrl(href) {
+    if (!href) return null;
+    let url;
+    try { url = new URL(href, location.origin); } catch { return null; }
+    if (!/(^|\.)linkedin\.com$/i.test(url.hostname)) return null;
+    const match = url.pathname.match(/^\/(company|school|showcase)\/([^/?#]+)\/?$/i);
+    if (!match) return null;
+    return `https://www.linkedin.com/${match[1].toLowerCase()}/${decodeURIComponent(match[2]).toLowerCase()}/`;
+  }
+
+  function followButtonName(button) {
+    const aria = (button.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    const fromAria = aria.match(/^follow\s+(.+)$/i);
+    if (fromAria) {
+      const name = fromAria[1].replace(/\s+follow$/i, "").replace(/\s+/g, " ").trim();
+      if (name && name.length <= 60 && !/[•|]|\balso follow\b/i.test(name)) return name;
+    }
+    const text = visibleText(button).replace(/\s+/g, " ").trim();
+    const fromText = text.match(/^follow\s+(.+?)(?:\s+follow)?$/i);
+    if (!fromText || text.length > 60) return "";
+    return fromText[1].replace(/\s+follow$/i, "").replace(/\s+/g, " ").trim();
+  }
+
+  function skippedThinFollow(button) {
+    if (!button) return true;
+    const role = (button.getAttribute("role") || "").toLowerCase();
+    if (button.tagName !== "BUTTON" && role !== "button") return true;
+    const label = `${button.getAttribute("aria-label") || ""} ${visibleText(button)}`;
+    if (/show more/i.test(label)) return true;
+    if (/following|unfollow/i.test(label)) return true;
+    if (button.getAttribute("aria-pressed") === "true") return true;
+    return !isFollowName(button.getAttribute("aria-label") || visibleText(button));
+  }
+
+  function followPillBox(node) {
+    if (!node?.getBoundingClientRect) return null;
+    const r = node.getBoundingClientRect();
+    if (!(r.width >= 8 && r.height >= 8 && r.width <= 220 && r.height <= 80)) return null;
+    return { x: r.x, y: r.y, width: r.width, height: r.height, top: r.top, bottom: r.bottom };
+  }
+
+  function followWordNode(button) {
+    const painted = [...button.querySelectorAll("span, strong")].find((node) => /^follow$/i.test(visibleText(node)));
+    if (painted) return painted;
+    if (/^follow$/i.test(visibleText(button))) return button;
+    return null;
+  }
+
+  function followHitLabel(el) {
+    if (!el) return "";
+    return labelOf(el.closest("button, [role='button'], a") || el);
+  }
+
+  // A point is usable only when the painted element is the Follow button or
+  // inside it. The right rail, a name link, More, and Connect are not.
+  function followHitBlock(button, el) {
+    if (!el) return "";
+    if (el === button || button.contains(el)) return "";
+    const host = el.closest("button, [role='button'], a, aside, section") || el;
+    const label = followHitLabel(el);
+    if (/people you may know/i.test(label)) return label;
+    if (/invite\s+.+\s+to connect|\bconnect\b/i.test(label)) return label;
+    if (isMoreControl(host) || /^more$/i.test(visibleText(host))) return label || "more";
+    if (el.closest("aside, [role='complementary']")) return label || "right rail";
+    const link = el.closest("a[href]");
+    if (link && !button.contains(link) && isProfileHref(link.getAttribute("href"))) return label || "name link";
+    return label || "not-follow";
+  }
+
+  function readFollowAim(button) {
+    const word = followWordNode(button);
+    const rect = followPillBox(button) || (word ? followPillBox(word) : null);
+    if (!rect) return { ok: false, hitLabel: "", x: 0, y: 0, box: null };
+    const x = rect.x + rect.width / 2;
+    const y = rect.y + rect.height / 2;
+    const box = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    const hit = hitAt(x, y);
+    if (!hit.el) return { ok: false, hitLabel: "", x, y, box };
+    const blocked = followHitBlock(button, hit.el);
+    const onButton = hit.el === button || button.contains(hit.el);
+    return {
+      ok: Boolean(onButton && !blocked),
+      hitLabel: blocked || followHitLabel(hit.el),
+      x,
+      y,
+      box,
+    };
+  }
+
+  // Scroll the Follow button into the viewport, then re-read the box. A large x
+  // is not a reason to skip. A center that is still outside the viewport is.
+  function aimThinFollow(button) {
+    const target = followWordNode(button) || button;
+    const vh = () => window.innerHeight || 900;
+    try { target.scrollIntoView({ block: "center", inline: "nearest" }); } catch { /* ignore */ }
+    let aim = readFollowAim(button);
+    if (aim.box && (aim.y < 40 || aim.y > vh() - 20)) {
+      const root = document.querySelector("main#workspace") || document.scrollingElement || document.documentElement;
+      try { root.scrollBy(0, aim.y - vh() / 2); } catch { /* ignore */ }
+      aim = readFollowAim(button);
+    }
+    if (!aim.box) return aim;
+    if (aim.y < 40 || aim.y > vh() - 20) return { ...aim, ok: false, hitLabel: aim.hitLabel || "outside-viewport" };
+    return aim;
+  }
+
+  function sameFollowName(a, b) {
+    const left = String(a || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const right = String(b || "").toLowerCase().replace(/\s+/g, " ").trim();
+    if (!left || !right) return false;
+    return left === right || left.includes(right) || right.includes(left);
+  }
+
+  function promotedNear(button) {
+    for (let node = button.parentElement, depth = 0; node && depth < 6; node = node.parentElement, depth += 1) {
+      const otherFollows = [...node.querySelectorAll("button, [role='button']")].filter((el) => el !== button && !skippedThinFollow(el));
+      if (otherFollows.length) break;
+      if (/promoted|sponsored/i.test(visibleText(node).slice(0, 400))) return true;
+    }
+    return false;
+  }
+
+  // People and companies are both pressable on a thin feed. Healthy-feed
+  // followCandidates stays people-only through followContext.
+  function classifyThinFollow(button) {
+    if (skippedThinFollow(button) || promotedNear(button)) return null;
+    const aim = aimThinFollow(button);
+    if (!aim.box) return null;
+    const box = aim.box;
+    const root = feedRoot();
+    if (!root || root === document.body || !root.contains(button)) return null;
+    const name = followButtonName(button);
+    const label = accessibleName(button);
+    const closest = button.closest("a[href]");
+    if (closest && !/\/newsletters?\//i.test(closest.getAttribute("href") || "")) {
+      const href = closest.getAttribute("href");
+      const person = personProfileUrl(href);
+      const org = organizationUrl(href);
+      const linked = shortIdentityName(visibleText(closest));
+      if (person) return { kind: "person", name: name || linked || "person", url: person, box, label, ok: aim.ok, hitLabel: aim.hitLabel, x: aim.x, y: aim.y };
+      if (org) return { kind: "company", name: name || linked || "company", url: org, box, label, ok: aim.ok, hitLabel: aim.hitLabel, x: aim.x, y: aim.y };
+    }
+    const people = [];
+    const orgs = [];
+    for (let node = button.parentElement, depth = 0; node && node !== root && depth < 8; node = node.parentElement, depth += 1) {
+      for (const link of node.querySelectorAll("a[href]")) {
+        const href = link.getAttribute("href");
+        if (/\/newsletters?\//i.test(href || "")) continue;
+        const person = personProfileUrl(href);
+        const org = organizationUrl(href);
+        const linked = shortIdentityName(visibleText(link));
+        if (person && !people.some((item) => item.url === person)) people.push({ url: person, name: linked });
+        if (org && !orgs.some((item) => item.url === org)) orgs.push({ url: org, name: linked });
+      }
+      if (people.length || orgs.length) break;
+    }
+    const namedPerson = people.find((item) => item.name && sameFollowName(item.name, name)) || (people.length === 1 && !orgs.length ? people[0] : null);
+    const namedOrg = orgs.find((item) => item.name && sameFollowName(item.name, name)) || (orgs.length === 1 && !people.length ? orgs[0] : null);
+    if (namedPerson && !namedOrg) return { kind: "person", name: name || namedPerson.name || "person", url: namedPerson.url, box, label, ok: aim.ok, hitLabel: aim.hitLabel, x: aim.x, y: aim.y };
+    if (namedOrg && !namedPerson) return { kind: "company", name: name || namedOrg.name || "company", url: namedOrg.url, box, label, ok: aim.ok, hitLabel: aim.hitLabel, x: aim.x, y: aim.y };
+    if (!name) return null;
+    return { kind: "company", name, url: `https://www.linkedin.com/company/${encodeURIComponent(name.toLowerCase().replace(/\s+/g, "-"))}/`, box, label, ok: aim.ok, hitLabel: aim.hitLabel, x: aim.x, y: aim.y };
+  }
+
+  function shortIdentityName(text) {
+    const clean = String(text || "").replace(/\s+/g, " ").trim();
+    if (!clean || clean.length > 60 || /[•|]|\balso follow\b|\bcompany\b/i.test(clean)) return "";
+    return clean;
+  }
+
+  function thinFollowStatus(url) {
+    const root = feedRoot();
+    if (!root || !url) return "missing";
+    for (const button of root.querySelectorAll("button, [role='button']")) {
+      let href = "";
+      const closest = button.closest("a[href]");
+      if (closest) href = closest.getAttribute("href") || "";
+      if (!href) {
+        for (let node = button.parentElement, depth = 0; node && node !== root && depth < 6; node = node.parentElement, depth += 1) {
+          const link = [...node.querySelectorAll("a[href]")].find((anchor) => {
+            const id = personProfileUrl(anchor.getAttribute("href")) || organizationUrl(anchor.getAttribute("href"));
+            return id === url;
+          });
+          if (link) {
+            href = link.getAttribute("href") || "";
+            break;
+          }
+        }
+      }
+      const id = personProfileUrl(href) || organizationUrl(href);
+      if (id !== url) continue;
+      const label = `${button.getAttribute("aria-label") || ""} ${visibleText(button)}`;
+      if (/following|unfollow/i.test(label) || button.getAttribute("aria-pressed") === "true") return "following";
+      if (/\bfollow\b/i.test(label)) return "follow";
+    }
+    return "missing";
+  }
+
+  function thinFollowRow(button, item) {
+    return {
+      kind: item.kind,
+      name: item.name,
+      url: item.url,
+      label: item.label || accessibleName(button),
+      tag: (button.tagName || "").toLowerCase(),
+      x: item.x,
+      y: item.y,
+      hitLabel: item.hitLabel || "",
+      box: item.box,
+    };
+  }
+
+  function thinFeedFollowPlan() {
+    const root = feedRoot();
+    if (!root || root === document.body) return { ready: [], blocked: [] };
+    const ready = [];
+    const blocked = [];
+    const seen = new Set();
+    for (const button of root.querySelectorAll("button, [role='button']")) {
+      const item = classifyThinFollow(button);
+      if (!item || seen.has(item.url)) continue;
+      seen.add(item.url);
+      const row = thinFollowRow(button, item);
+      if (item.ok) ready.push(row);
+      else blocked.push(row);
+    }
+    ready.sort((a, b) => a.y - b.y || a.x - b.x);
+    return { ready, blocked };
+  }
+
+  function thinFeedFollows() {
+    return thinFeedFollowPlan().ready;
+  }
+
   function followCandidates() {
     const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
     return followButtons()
@@ -526,13 +808,31 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return dismissed;
   }
 
+  function isMuteLabel(value) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    return /^(un)?mute( video)?$/i.test(text) || /^turn (on|off) sound$/i.test(text);
+  }
+
+  function videoPlayer(post) {
+    return post.querySelector("video, .feed-shared-linkedin-video, .update-components-linkedin-video, .video-js, [data-test-id='video-player']");
+  }
+
+  function muteControl(post) {
+    const player = videoPlayer(post);
+    const scope = player?.parentElement || player || post;
+    return [...scope.querySelectorAll("button, [role='button']")].find((el) => isMuteLabel(el.getAttribute("aria-label") || el.innerText || "")) || null;
+  }
+
   function mapPost(el, vh) {
     const box = el.getBoundingClientRect();
     const text = (el.innerText || "").replace(/\s+/g, " ").trim();
     const like = likeControl(el);
     const more = moreControl(el);
+    const video = videoPlayer(el);
+    const mute = video ? muteControl(el) : null;
     const likeBox = like?.button ? like.button.getBoundingClientRect() : null;
     const moreBox = more ? more.getBoundingClientRect() : null;
+    const muteBox = mute ? mute.getBoundingClientRect() : null;
     return {
       urn: postIdentity(el),
       top: box.top,
@@ -544,6 +844,11 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       liked: Boolean(like?.pressed || (like?.button && reactionAlreadyGiven(like.button))),
       hasLike: Boolean(like?.button),
       hasMore: Boolean(more),
+      hasVideo: Boolean(video),
+      hasMute: Boolean(mute),
+      muteLabel: mute ? (mute.getAttribute("aria-label") || mute.innerText || "").replace(/\s+/g, " ").trim() : null,
+      muteX: muteBox ? muteBox.x + muteBox.width / 2 : null,
+      muteY: muteBox ? muteBox.y + muteBox.height / 2 : null,
       likeX: likeBox ? likeBox.x + Math.min(Math.max(10, likeBox.width * 0.18), 18) : null,
       likeY: likeBox ? likeBox.y + likeBox.height * 0.55 : null,
       moreX: moreBox ? moreBox.x + moreBox.width / 2 : null,
@@ -608,6 +913,21 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       if (isProfileHref(hit.href)) return null;
       return { x, y, label: (more.innerText || more.getAttribute("aria-label") || "").trim() };
     }
+    if (control === "mute") {
+      const mute = muteControl(post);
+      if (!mute) return null;
+      const r = mute.getBoundingClientRect();
+      // Player controls sit under the video surface until hover, so elementFromPoint
+      // often hits the <video> instead of the button. The button box is the target.
+      if (r.width < 8 || r.height < 8) return null;
+      const vh = window.innerHeight || 900;
+      if (r.bottom < 80 || r.top > vh - 40) return null;
+      return {
+        x: r.x + r.width / 2,
+        y: r.y + r.height / 2,
+        label: mute.getAttribute("aria-label") || mute.innerText || "mute",
+      };
+    }
     const like = likeControl(post);
     if (!like?.button) return null;
     const r = like.button.getBoundingClientRect();
@@ -639,8 +959,20 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       if (!visitAnchors().some((t) => t.anchor === anchor)) return { safe: false, reason: "not-approved-link", label: hit.label };
       return { safe: true, label: hit.label };
     }
-    if (isProfileHref(hit.href)) return { safe: false, reason: "profile-link", href: hit.href, label: hit.label };
     const host = hit.el.closest("button, [role='button']");
+    if (kind === "thin-follow") {
+      if (isMoreControl(host) || /^more$/i.test(visibleText(host || hit.el))) {
+        return { safe: false, reason: "more", label: hit.label };
+      }
+      if (/people you may know/i.test(hit.label)) return { safe: false, reason: "not-thin-follow", label: hit.label };
+      if (/invite\s+.+\s+to connect|\bconnect\b/i.test(hit.label)) return { safe: false, reason: "not-thin-follow", label: hit.label };
+      if (!host || skippedThinFollow(host) || !(host === hit.el || host.contains(hit.el))) {
+        if (isProfileHref(hit.href)) return { safe: false, reason: "profile-link", href: hit.href, label: hit.label };
+        return { safe: false, reason: "not-thin-follow", label: hit.label };
+      }
+      return { safe: true, label: hit.label };
+    }
+    if (isProfileHref(hit.href)) return { safe: false, reason: "profile-link", href: hit.href, label: hit.label };
     if (kind === "follow") {
       if (!isFollowControl(host)) return { safe: false, reason: "not-follow-button", label: hit.label };
       const context = followContext(host);
@@ -656,6 +988,18 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       if (!isMoreControl(host)) return { safe: false, reason: "not-more-button", label: hit.label };
       return { safe: true, label: hit.label };
     }
+    if (kind === "mute") {
+      const post = urn ? findPost(urn) : null;
+      const mute = post ? muteControl(post) : null;
+      if (mute) {
+        const r = mute.getBoundingClientRect();
+        if (r.width >= 8 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+          return { safe: true, label: labelOf(mute) };
+        }
+      }
+      if (isMuteLabel(hit.label) || (host && isMuteLabel(labelOf(host)))) return { safe: true, label: hit.label };
+      return { safe: false, reason: "not-mute-button", label: hit.label };
+    }
     if (kind === "like") {
       if (helpers.isMediaHit(hit.el)) return { safe: false, reason: "media", label: hit.label };
       if (!isLikeControl(host)) return { safe: false, reason: "not-like-button", label: hit.label };
@@ -664,7 +1008,12 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
       return { safe: true, label: hit.label };
     }
     if (kind === "see-new") {
-      if (!isLoadMorePostsLabel(host?.innerText || hit.label || "")) {
+      const owns = (node) => Boolean(node) && (
+        isLoadMorePostsLabel(labelOf(node))
+        || isLoadMorePostsLabel(node.innerText || "")
+        || [...(node.querySelectorAll?.("button, a, [role='button']") || [])].some((child) => isLoadMorePostsLabel(labelOf(child)))
+      );
+      if (!owns(host) && !owns(hit.el)) {
         return { safe: false, reason: "not-see-new-posts", label: hit.label };
       }
       return { safe: true, label: hit.label };
@@ -680,6 +1029,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
 
   function pointerBounds() {
     const root = feedRoot();
+    if (!root?.getBoundingClientRect) return null;
     const r = root.getBoundingClientRect();
     return helpers.feedPointerBounds(
       { left: r.left, width: r.width },
@@ -703,7 +1053,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     const root = feedRoot();
     const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
     const cards = postCards();
-    const buttons = [...root.querySelectorAll("button")];
+    const buttons = root ? [...root.querySelectorAll("button")] : [];
     return {
       title: document.title,
       readyState: document.readyState,
@@ -750,7 +1100,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
   function dump() {
     const root = feedRoot();
     const cards = postCards();
-    const buttons = [...root.querySelectorAll("button")];
+    const buttons = root ? [...root.querySelectorAll("button")] : [];
     const likes = buttons.filter(isLikeControl);
     const comments = buttons.filter(isCommentControl);
     return {
@@ -836,6 +1186,117 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     };
   }
 
+  function viewportSize() {
+    const vh = helpers.feedViewportHeight(window.innerHeight, document.documentElement?.clientHeight, document.body?.clientHeight);
+    const vw = Number(window.innerWidth) || Number(document.documentElement?.clientWidth) || 1280;
+    return { vh, vw };
+  }
+
+  function laidOutBox(el) {
+    const box = el?.getBoundingClientRect?.();
+    if (!box) return null;
+    const width = Number(box.width) || 0;
+    const height = Number(box.height) || 0;
+    const top = Number(box.top) || 0;
+    const left = Number(box.left) || 0;
+    const bottom = Number.isFinite(Number(box.bottom)) ? Number(box.bottom) : top + height;
+    const right = Number.isFinite(Number(box.right)) ? Number(box.right) : left + width;
+    return { width, height, top, left, bottom, right };
+  }
+
+  function boxInView(box, vh, vw) {
+    if (!box || box.width <= 0 || box.height <= 0) return false;
+    if (box.bottom <= 0 || box.top >= vh) return false;
+    if (box.right <= 0 || box.left >= vw) return false;
+    return true;
+  }
+
+  function elementShown(el) {
+    try {
+      const style = getComputedStyle(el);
+      if (style?.display === "none" || style?.visibility === "hidden" || style?.visibility === "collapse") return false;
+    } catch { /* a document without layout styles still reports its box */ }
+    return true;
+  }
+
+  function classText(el) {
+    return String(el?.getAttribute?.("class") || "").toLowerCase();
+  }
+
+  // complete === false means the browser is still fetching the image.
+  // A complete image with naturalWidth 0 is broken. LinkedIn also keeps
+  // "ghost" on a default avatar after it has painted. Neither may freeze a session.
+  function imageSettled(img) {
+    return Boolean(img) && img.tagName === "IMG" && img.complete !== false;
+  }
+
+  function markerSettled(el) {
+    if (imageSettled(el)) return true;
+    const imgs = typeof el.querySelectorAll === "function" ? [...el.querySelectorAll("img")] : [];
+    return imgs.length > 0 && imgs.every((img) => img.complete !== false);
+  }
+
+  function countPendingImages(vh, vw) {
+    let pending = 0;
+    for (const img of document.querySelectorAll("img")) {
+      if (img.complete !== false) continue;
+      if (!elementShown(img)) continue;
+      const box = laidOutBox(img);
+      if (!box || box.width < 24 || box.height < 24) continue;
+      if (!boxInView(box, vh, vw)) continue;
+      pending += 1;
+    }
+    return pending;
+  }
+
+  function countLoadingMarkers(vh, vw) {
+    const nodes = document.querySelectorAll('[aria-busy="true"], .artdeco-loader, [class*="skeleton"], [class*="Skeleton"], [class*="ghost"], [class*="Ghost"]');
+    let count = 0;
+    for (const el of nodes) {
+      if (!elementShown(el)) continue;
+      const box = laidOutBox(el);
+      if (!box || box.width < 8 || box.height < 8) continue;
+      if (!boxInView(box, vh, vw)) continue;
+      const busy = el.getAttribute?.("aria-busy") === "true";
+      const loader = el.matches?.(".artdeco-loader") || classText(el).includes("artdeco-loader");
+      if (!busy && !loader) {
+        const name = classText(el);
+        if (!name.includes("skeleton") && !name.includes("ghost")) continue;
+        if (markerSettled(el)) continue;
+      }
+      count += 1;
+    }
+    return count;
+  }
+
+  function railSnapshot() {
+    const asides = [...document.querySelectorAll("main aside, #workspace aside")];
+    let railText = 0;
+    let railControls = 0;
+    for (const el of asides) {
+      railText += (el.innerText || "").replace(/\s+/g, " ").trim().length;
+      railControls += el.querySelectorAll("a, button, img, [role='button']").length;
+    }
+    return { railText, railControls };
+  }
+
+  function feedLoadSnapshot() {
+    const column = columnState();
+    const { vh, vw } = viewportSize();
+    const rails = railSnapshot();
+    return {
+      readyState: document.readyState || "complete",
+      pendingImages: countPendingImages(vh, vw),
+      skeletons: countLoadingMarkers(vh, vw),
+      feedHeight: column.feedHeight || 0,
+      railText: rails.railText,
+      railControls: rails.railControls,
+      visibleUpdates: column.visibleUpdates || 0,
+      top: column.top || 0,
+      maxTop: column.maxTop || 0,
+    };
+  }
+
   function wheelAnchor() {
     const feed = feedListEl();
     const box = feed?.getBoundingClientRect?.();
@@ -873,26 +1334,99 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return { healed: true, from, to: workspace.scrollTop, ...columnState(), top: workspace.scrollTop };
   }
 
+  function pillBox(box) {
+    const width = Number(box?.width) || 0;
+    const height = Number(box?.height) || 0;
+    if (width < 8 || height < 8 || width > 800 || height > 96) return null;
+    return box;
+  }
+
+  function textBox(el) {
+    const doc = el.ownerDocument || document;
+    if (typeof doc.createRange !== "function") return null;
+    const texts = [];
+    const stack = [...(el.childNodes || [])];
+    while (stack.length) {
+      const node = stack.shift();
+      if (node.nodeType === 3 && String(node.textContent || "").trim()) texts.push(node);
+      else if (node.childNodes) stack.push(...node.childNodes);
+    }
+    for (const text of texts) {
+      try {
+        const range = doc.createRange();
+        range.selectNodeContents(text);
+        const box = pillBox(range.getBoundingClientRect());
+        if (box) return { node: text.parentElement || el, box };
+      } catch { /* a document without layout ranges has no text box */ }
+    }
+    return null;
+  }
+
+  // inspect() lists every feed button by labelOf. The visible pill is often the
+  // button's parent: the button itself is an empty accessible node.
+  function pressBox(el) {
+    const own = pillBox(el.getBoundingClientRect());
+    if (own) return { node: el, box: own };
+    for (const child of el.querySelectorAll("*")) {
+      const box = pillBox(child.getBoundingClientRect());
+      if (box) return { node: child, box };
+    }
+    const fromText = textBox(el);
+    if (fromText) return fromText;
+    let parent = el.parentElement;
+    while (parent && parent !== document.body && parent !== document.documentElement) {
+      const box = pillBox(parent.getBoundingClientRect());
+      if (box) return { node: parent, box };
+      parent = parent.parentElement;
+    }
+    return null;
+  }
+
   function findSeeNewPosts() {
     const vh = helpers.feedViewportHeight(
       window.innerHeight,
       document.documentElement?.clientHeight,
       document.body?.clientHeight,
     );
-    const matches = [...document.querySelectorAll("button, a")].filter((el) => {
-      const label = (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-      if (!isLoadMorePostsLabel(label)) return false;
-      return helpers.seeNewPostsVisible(el.getBoundingClientRect(), vh);
-    });
-    if (!matches.length) return null;
-    matches.sort((a, b) => {
-      const ra = a.getBoundingClientRect();
-      const rb = b.getBoundingClientRect();
-      return Math.abs((ra.top + ra.bottom) / 2 - vh / 2) - Math.abs((rb.top + rb.bottom) / 2 - vh / 2);
-    });
-    const match = matches[0];
-    const r = match.getBoundingClientRect();
-    return { x: r.x + r.width / 2, y: r.y + r.height / 2, label: (match.innerText || "").trim() };
+    const root = feedRoot();
+    const matches = [...document.querySelectorAll("button, a, [role='button']")]
+      .filter((el) => isLoadMorePostsLabel(labelOf(el)))
+      .sort((a, b) => (root?.contains(a) ? 0 : 1) - (root?.contains(b) ? 0 : 1));
+    for (const el of matches) {
+      let target = pressBox(el);
+      if (!target) continue;
+      if (!helpers.seeNewPostsVisible(target.box, vh)) {
+        const scroller = typeof target.node.scrollIntoView === "function" ? target.node : el;
+        if (typeof scroller.scrollIntoView === "function") scroller.scrollIntoView({ block: "center", inline: "nearest" });
+        const again = pressBox(el);
+        if (again) target = again;
+        if (!helpers.seeNewPostsVisible(target.box, vh)) {
+          const workspace = workspaceEl();
+          if (workspace && Number.isFinite(Number(target.box.top))) {
+            workspace.scrollTop = (workspace.scrollTop || 0) + target.box.top - Math.round(vh * 0.4);
+            const nudged = pressBox(el);
+            if (nudged) target = nudged;
+          }
+        }
+      }
+      const box = target.box;
+      if (!helpers.seeNewPostsVisible(box, vh)) continue;
+      const round = (value) => Math.round(Number(value) || 0);
+      return {
+        x: box.x + box.width / 2,
+        y: box.y + box.height / 2,
+        label: (el.innerText || el.getAttribute("aria-label") || labelOf(el)).trim(),
+        tag: String(target.node.tagName || "").toLowerCase(),
+        box: {
+          x: round(box.x),
+          y: round(box.y),
+          top: round(box.top),
+          width: round(box.width),
+          height: round(box.height),
+        },
+      };
+    }
+    return null;
   }
 
   function align(urn, control) {
@@ -904,7 +1438,7 @@ export function feedDomWorld(helpers = feedDomHelpers()) {
     return true;
   }
 
-  return { collect, locate, isLiked, inspect, dump, reactionMenuOpen, mediaOverlayOpen, findSeeNewPosts, probe, pointerBounds, align, dismissBlockingModals, columnState, wheelAnchor, healFeedColumn, followCandidates, locateFollow, followState, dialogOpen, visitTargets, locateVisit };
+  return { collect, locate, isLiked, inspect, dump, reactionMenuOpen, mediaOverlayOpen, findSeeNewPosts, probe, pointerBounds, align, dismissBlockingModals, columnState, feedLoadSnapshot, wheelAnchor, healFeedColumn, followCandidates, thinFeedFollows, thinFeedFollowPlan, thinFollowStatus, locateFollow, followState, dialogOpen, visitTargets, locateVisit };
 }
 
 async function runWorld(page, method, ...args) {
@@ -951,6 +1485,10 @@ export async function readFeedColumn(page) {
   return runWorld(page, "columnState");
 }
 
+export async function readFeedLoadSnapshot(page) {
+  return runWorld(page, "feedLoadSnapshot");
+}
+
 export async function feedWheelAnchor(page) {
   return runWorld(page, "wheelAnchor");
 }
@@ -977,6 +1515,18 @@ export async function pointerBounds(page) {
 
 export async function findFollowCandidates(page) {
   return runWorld(page, "followCandidates");
+}
+
+export async function scanThinFeedFollows(page) {
+  return runWorld(page, "thinFeedFollows");
+}
+
+export async function scanThinFeedFollowPlan(page) {
+  return runWorld(page, "thinFeedFollowPlan");
+}
+
+export async function readThinFollowStatus(page, url) {
+  return runWorld(page, "thinFollowStatus", url);
 }
 
 export async function locateFollow(page, profileUrl) {

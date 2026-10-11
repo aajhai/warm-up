@@ -46,6 +46,10 @@ function raceTimeout(promise, timeoutMs, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
+export function isClosedTargetError(error) {
+  return /Target closed|Session closed\. Most likely the page has been closed|No target with given id/i.test(error?.message || "");
+}
+
 const pagePointers = new WeakMap();
 
 // One pointer per tab, so a Grow or profile click starts where the feed pointer stopped.
@@ -58,8 +62,15 @@ export function pagePointer(page) {
   return pointer;
 }
 
+// On a slow Orbita/proxy profile a burst of tiny mouse moves outruns the input pipeline and
+// each move waits out the command timeout. After a stall the pointer slows down for a while:
+// moves are not re-sent, and moves closer together than the slow gap are skipped (the
+// coordinates still track). Presses, releases, and wheels are always sent.
+export const POINTER_SLOW_MODE_MS = 60_000;
+export const POINTER_SLOW_MOVE_GAP_MS = 120;
+
 export class TrustedPointer {
-  constructor(page, { commandTimeoutMs = POINTER_COMMAND_TIMEOUT_MS } = {}) {
+  constructor(page, { commandTimeoutMs = POINTER_COMMAND_TIMEOUT_MS, now = Date.now } = {}) {
     this.page = page;
     this.cdp = null;
     this.dead = false;
@@ -67,6 +78,20 @@ export class TrustedPointer {
     this.y = 0;
     this.strikes = 0;
     this.commandTimeoutMs = commandTimeoutMs;
+    this.now = now;
+    this.slowUntil = 0;
+    this.stalls = 0;
+    this.lastMoveAt = 0;
+  }
+
+  slowed() {
+    return this.now() < this.slowUntil;
+  }
+
+  noteStall() {
+    this.stalls += 1;
+    if (!this.slowed()) log.warn("Pointer input is stalling on this profile. Slowing the pointer cadence.", { stalls: this.stalls, slowForSec: POINTER_SLOW_MODE_MS / 1000 });
+    this.slowUntil = this.now() + POINTER_SLOW_MODE_MS;
   }
 
   coords() {
@@ -97,6 +122,7 @@ export class TrustedPointer {
   }
 
   async dispatch(params, timeoutMs = this.commandTimeoutMs) {
+    if (this.closed) throw new Error("Target closed: pointer page target is gone");
     const ephemeral = this.dead || this.strikes >= 2;
     let session;
     try {
@@ -104,6 +130,10 @@ export class TrustedPointer {
         ? await raceTimeout(this.page.createCDPSession(), timeoutMs, "CDP mouse session attach timed out")
         : await raceTimeout(this.attach(), timeoutMs, "CDP mouse session attach timed out");
     } catch (error) {
+      if (isClosedTargetError(error)) {
+        this.closed = true;
+        throw error;
+      }
       this.strikes += 1;
       if (this.strikes >= 2) this.markDead();
       await this.recover();
@@ -117,7 +147,16 @@ export class TrustedPointer {
       );
       this.strikes = 0;
     } catch (error) {
+      if (isClosedTargetError(error)) {
+        // The tab's target is already gone. That is not a stall, and bringing a dead
+        // tab forward or re-sending cannot help; the caller re-resolves the live page.
+        this.closed = true;
+        log.warn("Pointer target closed under the input session; the page must be re-resolved.", { message: error.message });
+        await this.drop(session);
+        throw error;
+      }
       this.strikes += 1;
+      this.noteStall();
       log.warn("Pointer CDP command stalled; dropping that CDP input session instead of waiting for protocolTimeout.", {
         message: error.message,
         strikes: this.strikes,
@@ -134,7 +173,8 @@ export class TrustedPointer {
   async sendWithRetry(params) {
     try {
       await this.dispatch(params);
-    } catch {
+    } catch (error) {
+      if (isClosedTargetError(error)) throw error;
       await this.dispatch(params);
     }
   }
@@ -142,9 +182,12 @@ export class TrustedPointer {
   async move(x, y) {
     this.x = x;
     this.y = y;
+    const slow = this.slowed();
+    if (slow && this.now() - this.lastMoveAt < POINTER_SLOW_MOVE_GAP_MS) return;
+    this.lastMoveAt = this.now();
     const { x: px, y: py } = this.coords();
     try {
-      await this.sendWithRetry({
+      await (slow ? this.dispatch.bind(this) : this.sendWithRetry.bind(this))({
         type: "mouseMoved",
         x: px,
         y: py,

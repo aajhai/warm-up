@@ -1,9 +1,43 @@
-import { alignControl, collectPosts, feedWheelAnchor, healFeedColumn, locateControl, pointerBounds, probePoint, likeActionBand, readFeedColumn } from "../scenario/linkedinDom.js";
+import { alignControl, collectPosts, feedWheelAnchor, healFeedColumn, locateControl, pointerBounds, probePoint, likeActionBand, readFeedColumn, readFeedLoadSnapshot } from "../scenario/linkedinDom.js";
+import { scrollHoldReason } from "../scenario/linkedinFeed.js";
 import { createLogger } from "../logger.js";
 import { randomFloat, randomInt, sleep, sleepJitter } from "../util/random.js";
 import { pagePointer, trackpadDeltas } from "./trackpad.js";
 
 const log = createLogger("human");
+
+const FEED_HOLD_WAITS = 4;
+const FEED_HOLD_MIN_MS = 1200;
+const FEED_HOLD_MAX_MS = 2500;
+
+function paintDetails(snapshot) {
+  return {
+    readyState: snapshot?.readyState || "",
+    pendingImages: snapshot?.pendingImages || 0,
+    skeletons: snapshot?.skeletons || 0,
+    feedHeight: snapshot?.feedHeight || 0,
+    railText: snapshot?.railText || 0,
+    railControls: snapshot?.railControls || 0,
+  };
+}
+
+// Sample, wait like a person, sample again. At most four waits. Still loading means do not wheel.
+async function awaitFeedPaint(page, pause) {
+  let previous = null;
+  let snapshot = null;
+  let reason = null;
+  for (let sample = 0; sample <= FEED_HOLD_WAITS; sample += 1) {
+    snapshot = await readFeedLoadSnapshot(page);
+    reason = scrollHoldReason(snapshot, previous);
+    if (!reason) return { stillLoading: false, reason: null, snapshot };
+    if (sample === FEED_HOLD_WAITS) break;
+    log.info("Feed is still loading. Waiting before scrolling.", { reason, wait: sample + 1, ...paintDetails(snapshot) });
+    previous = snapshot;
+    await pause(FEED_HOLD_MIN_MS, FEED_HOLD_MAX_MS);
+  }
+  log.info("Feed is still loading. Not scrolling this pass.", { reason, ...paintDetails(snapshot) });
+  return { stillLoading: true, reason, snapshot };
+}
 
 function bezier(t, p0, p1, p2, p3) {
   const u = 1 - t;
@@ -11,7 +45,7 @@ function bezier(t, p0, p1, p2, p3) {
 }
 
 export function controlNeedsFeedClamp(kind) {
-  return kind !== "like" && kind !== "more" && kind !== "see-new" && kind !== "home" && kind !== "follow" && kind !== "visit";
+  return kind !== "like" && kind !== "more" && kind !== "see-new" && kind !== "home" && kind !== "follow" && kind !== "thin-follow" && kind !== "visit" && kind !== "mute";
 }
 
 export class HumanController {
@@ -68,7 +102,8 @@ export class HumanController {
       await this.pointer.move(x, y);
       return;
     }
-    const steps = Math.max(12, Math.min(48, Math.round(Math.max(dist, 30) / 12)));
+    const fullSteps = Math.max(12, Math.min(48, Math.round(Math.max(dist, 30) / 12)));
+    const steps = this.pointer.slowed?.() ? Math.min(fullSteps, 6) : fullSteps;
     const cp1x = startX + (x - startX) * randomFloat(0.18, 0.42) + randomFloat(-18, 18);
     const cp1y = startY + (y - startY) * randomFloat(0.08, 0.38) + randomFloat(-24, 24);
     const cp2x = startX + (x - startX) * randomFloat(0.55, 0.82) + randomFloat(-16, 16);
@@ -244,30 +279,27 @@ export class HumanController {
     );
   }
 
-  async scrollFeed({ reverseChance = 0.05, forceReverse = false } = {}) {
+  async scrollFeed({ reverseChance = 0.05, forceReverse = false, pause = sleepJitter } = {}) {
     const livePage = typeof this.page.url === "function";
     if (livePage) {
       const column = await readFeedColumn(this.page);
-      // Rails stay sticky while the lazy feed list scrolls off. Wheeling then
-      // only spins a blank center column.
-      if (column && (!column.feedVisible || column.visibleUpdates === 0)) {
-        const healed = await healFeedColumn(this.page);
-        if (healed?.healed) {
-          await sleep(320);
-          return {
-            reverse: false,
-            moved: Math.abs((healed.to || 0) - (healed.from || 0)),
-            ticks: 0,
-            before: column,
-            after: healed,
-            fallback: false,
-            healed: true,
-          };
-        }
+      // Nothing on screen. Do not wheel a blank feed; the caller refreshes instead.
+      if (column && (column.visibleUpdates || 0) === 0) {
+        return { reverse: false, moved: 0, ticks: 0, before: column, after: column, fallback: false, empty: true };
       }
-      if (column?.feedVisible && column.visibleUpdates === 0) {
-        await sleep(400);
-        return { reverse: false, moved: 0, ticks: 0, before: column, after: column, fallback: false, held: true };
+      const paint = await awaitFeedPaint(this.page, pause);
+      if (paint.stillLoading) {
+        const shot = paint.snapshot || column;
+        return {
+          held: true,
+          stillLoading: true,
+          reason: paint.reason,
+          moved: 0,
+          ticks: 0,
+          before: shot,
+          after: shot,
+          fallback: false,
+        };
       }
       const anchor = await feedWheelAnchor(this.page);
       if (anchor) await this.moveTo(anchor.x, anchor.y, { constrainToFeed: false });

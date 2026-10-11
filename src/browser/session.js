@@ -4,6 +4,7 @@ import { config } from "../config.js";
 import { createGoLoginClient } from "../gologin/client.js";
 import { createLogger } from "../logger.js";
 import { sleep } from "../util/random.js";
+import { isNetworkOutage, outageError } from "../util/connectivity.js";
 
 const log = createLogger("browser");
 
@@ -102,7 +103,15 @@ function assertProfileLock(profile) {
 
 export async function openWarmupBrowser() {
   const gologin = await createGoLoginClient();
-  const profile = await gologin.resolveProfile();
+  let profile;
+  try {
+    profile = await gologin.resolveProfile();
+  } catch (error) {
+    if (isNetworkOutage(error)) {
+      throw outageError(`GoLogin API unreachable before the browser opened (${error.cause?.code || error.message}). The profile was not started.`, error);
+    }
+    throw error;
+  }
   assertProfileLock(profile);
   const existing = await discoverProfileDebuggerUrl(profile.profile_id);
   if (existing) {

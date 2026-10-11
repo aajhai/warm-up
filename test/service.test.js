@@ -24,7 +24,7 @@ const { feedDomWorld, feedDomHelpers } = await import("../src/scenario/linkedinD
 const { Optimizer } = await import("../src/optimizer/reviewer.js");
 const { scrollDistance, HumanController, controlNeedsFeedClamp } = await import("../src/human/input.js");
 const { TrustedPointer } = await import("../src/human/trackpad.js");
-const { getWorkingPage, refreshStaleFeed, likePost, expandPost, maybeSeeNewPosts } = await import("../src/scenario/linkedinFeed.js");
+const { getWorkingPage, refreshStaleFeed, refreshEmptyFeed, likePost, expandPost, maybeSeeNewPosts } = await import("../src/scenario/linkedinFeed.js");
 const { LocalProfileLauncher } = await import("../src/gologin/local.js");
 const { CloudProfileLauncher } = await import("../src/gologin/cloud.js");
 const { planProfiles } = await import("../src/service.js");
@@ -638,8 +638,10 @@ test("test runs have zero likes; prospective like rate includes the next action"
     const optimizer = new Optimizer(emptyState());
     const preflight = optimizer.preflight();
     assert.equal(preflight.plan.likeCap, 0);
-    optimizer.plan = { likeCap: 3, warmupMs: 0, windDownMs: 0, skipFirstPosts: 0, likeRate: 0.03 };
-    assert.match(optimizer.gateLike({ post: { hasLike: true, textLen: 300 }, stats: { likes: 0, postsSeen: 20 }, elapsedMs: 1000, remainingMs: 1000 }).reason, /exceed/);
+    optimizer.plan = { likeCap: 3, warmupMs: 0, windDownMs: 0, skipFirstPosts: 0, likeRate: 0.03, minMsBetweenLikes: 0 };
+    const first = optimizer.gateLike({ post: { hasLike: true, textLen: 300 }, stats: { likes: 0, likeAttempts: 0, postsSeen: 20 }, elapsedMs: 1000, remainingMs: 1000 });
+    if (!first.allow) assert.doesNotMatch(first.reason, /exceed/, "the first like is not blocked by the 2-5% rate");
+    assert.match(optimizer.gateLike({ post: { hasLike: true, textLen: 300 }, stats: { likes: 1, likeAttempts: 1, postsSeen: 20 }, elapsedMs: 1000, remainingMs: 1000 }).reason, /exceed/);
   } finally { Object.assign(config, previous); }
 });
 
@@ -844,6 +846,21 @@ test("stale-feed recovery never reloads or jumps when no See new posts pill was 
   assert.equal(softJumps, 0);
 });
 
+test("an empty feed loads the feed URL once and does not reload the page", async () => {
+  const events = [];
+  const page = {
+    href: "https://www.linkedin.com/feed/",
+    url() { return page.href; },
+    reload: async () => { events.push("reload"); },
+    goto: async (url) => { events.push(`goto:${url}`); page.href = url; },
+  };
+  const stats = {};
+  assert.equal(await refreshEmptyFeed(page, stats, { pause: async () => {} }), true);
+  assert.deepEqual(events, ["goto:https://www.linkedin.com/feed/"]);
+  assert.equal(await refreshEmptyFeed(page, stats, { pause: async () => {} }), false);
+  assert.deepEqual(events, ["goto:https://www.linkedin.com/feed/"]);
+});
+
 test("a no-op pointer wheel falls back to one DOM scroll", async () => {
   let top = 0;
   let domScrolls = 0;
@@ -967,7 +984,7 @@ test("browser selection reuses and foregrounds the exact feed tab without creati
 
 test("local GoLogin starts synchronously, accepts only loopback CDP, and awaits stop", async () => {
   const calls = [];
-  const launcher = new LocalProfileLauncher({ token: "fixture-token", fetchImpl: async (url, options) => {
+  const launcher = new LocalProfileLauncher({ token: "fixture-token", pause: async () => {}, fetchImpl: async (url, options) => {
     if (typeof url !== "string") throw new Error("closed", { cause: { code: "ECONNREFUSED" } });
     calls.push({ url, ...options, body: JSON.parse(options.body) });
     return url.endsWith("start-profile")
@@ -1089,9 +1106,15 @@ test("cancellation during the final gesture cannot be reported as session succes
   controller.abort(new Error("Session interrupted by operator"));
   recordCancellation(result, controller.signal);
   assert.equal(result.aborted, true);
-  assert.equal(result.failureKind, "infra");
+  assert.equal(result.failureKind, "operator");
   assert.equal(result.reason, "Session interrupted by operator");
   assert.equal(result.postsSeen, 6);
+
+  const stalled = new AbortController();
+  const other = { aborted: false, postsSeen: 6, likes: 0 };
+  stalled.abort(new Error("Session made no progress for 5 minutes; ending it as an infrastructure failure"));
+  recordCancellation(other, stalled.signal);
+  assert.equal(other.failureKind, "infra");
 });
 
 function feedWorld(html, rects = {}) {

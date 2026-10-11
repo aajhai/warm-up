@@ -4,6 +4,7 @@ import { getDayStats } from "../sessionState.js";
 import { reserveAction, finishAction } from "../activity.js";
 import { isWeekendIst, istNow } from "../util/time.js";
 import { inviteHoldReason, loadSharedDay } from "../inviteHold.js";
+import { planSessionBudget } from "../sessionBudget.js";
 
 function loadShared() {
   try { return loadSharedDay(); } catch { return null; }
@@ -114,16 +115,10 @@ export class Optimizer {
     if (config.verifyWarmup && !plan.testRun && !plan.connectionTrial) {
       Object.assign(plan, {
         verify: true,
-        order: ["search", "feed", "grow"],
-        search: true,
-        searchCompany: true,
-        searchConnect: true,
-        inviteCount: Math.max(1, plan.inviteCount || 0),
-        feedVisits: Math.max(3, plan.feedVisits || 0),
         followCap: Math.max(1, plan.followCap || 0),
         followRecommended: true,
       });
-      this.note("VERIFY_WARMUP: forcing the verification checklist (company view, profile view, follow if visible, profile connect if exact, Grow invite). Caps still apply.");
+      this.note("VERIFY_WARMUP: feed checks only. Profile views and off-network connects stay off.");
     }
 
     const followsLeft = Math.max(0, config.follow.dailyBudget - (day.follows || 0));
@@ -137,9 +132,33 @@ export class Optimizer {
     if (hold && (plan.inviteCount || plan.searchConnect)) {
       plan.inviteCount = 0;
       plan.searchConnect = false;
-      this.note("Invites are held for this profile; views and feed browsing continue.", { hold });
+      this.note("Invites are held for this profile. Feed browsing continues without profile views.", { hold });
     }
-    if (!plan.inviteCount && !plan.growVisits) plan.order = (plan.order || ["feed"]).filter((step) => step !== "grow");
+    const minInvites = Number.parseInt(process.env.WARMUP_MIN_INVITES || "", 10);
+    if (!hold && config.connectionsEnabled && !plan.testRun && Number.isInteger(minInvites) && minInvites > 0) {
+      plan.inviteCount = Math.min(config.growInviteHardCap, Math.max(plan.inviteCount || 0, minInvites));
+      if (!plan.order.includes("grow")) plan.order = ["feed", "grow"];
+      this.note("This session will send at least one My Network invitation.", { inviteCount: plan.inviteCount });
+    }
+    // Profile and company pages stay closed. Invitations are only the My Network step,
+    // and only after the feed, for the sampled count.
+    plan.search = false;
+    plan.searchCompany = false;
+    plan.searchConnect = false;
+    plan.feedVisits = 0;
+    plan.growVisits = 0;
+    // The sampled session length covers feed + My Network + the post-invite linger.
+    const budget = planSessionBudget(plan);
+    plan.feedMs = budget.feedMs;
+    plan.growMs = budget.growMs;
+    if (budget.trimmed && (plan.order || []).includes("grow")) {
+      this.note("Session time budget: My Network gets fewer invitations so the whole session fits.", {
+        sessionMinutes: Math.round(plan.sessionMs / 6000) / 10, requested: budget.requestedInvites, invites: budget.inviteCount,
+      });
+    }
+    if ((plan.order || []).includes("grow")) plan.inviteCount = budget.inviteCount;
+    const steps = (plan.order || ["feed"]).filter((step) => step === "feed" || (step === "grow" && plan.inviteCount > 0));
+    plan.order = steps.includes("feed") ? steps : ["feed", ...steps];
 
     if (day.sessions === 0) {
       this.note("First session of the day. Do not like the top of the feed. Warm up the scroll first.");
@@ -147,6 +166,8 @@ export class Optimizer {
 
     this.note("Approved plan for the scenario builder.", {
       sessionMinutes: Math.round(plan.sessionMs / 6000) / 10,
+      feedMinutes: Math.round(plan.feedMs / 6000) / 10,
+      growMinutes: Math.round(plan.growMs / 6000) / 10,
       likeRate: Number(plan.likeRate.toFixed(3)),
       expandRate: Number(plan.expandRate.toFixed(3)),
       likeCap: plan.likeCap,
@@ -162,6 +183,8 @@ export class Optimizer {
       inviteCount: plan.inviteCount,
       feedVisits: plan.feedVisits,
       growVisits: plan.growVisits,
+      postViewChance: Number((plan.postViewChance ?? 0).toFixed(3)),
+      videoWatchCap: plan.videoWatchCap ?? 0,
     });
 
     this.plan = plan;
@@ -199,8 +222,11 @@ export class Optimizer {
     if (stats.lastLikeAt && Date.now() - stats.lastLikeAt < plan.minMsBetweenLikes) {
       return deny("Minimum interval between likes has not elapsed.");
     }
-    const prospectiveRate = ((stats.likeAttempts ?? stats.likes) + 1) / Math.max(stats.postsSeen, 1);
-    if (prospectiveRate > plan.likeRate) return deny("Would exceed the 2-5% like rate.");
+    const attempts = stats.likeAttempts ?? stats.likes ?? 0;
+    if (attempts > 0) {
+      const prospectiveRate = (attempts + 1) / Math.max(stats.postsSeen, 1);
+      if (prospectiveRate > plan.likeRate) return deny("Would exceed the 2-5% like rate.");
+    }
     const allowOdds = post.didExpand ? 0.55 : 0.38;
     if (Math.random() > allowOdds) return deny("Post was not selected for a like.");
 
@@ -253,7 +279,9 @@ export class Optimizer {
     const day = getDayStats(this.state, run?.dayKey || now.dateKey);
     day.postsSeen += result.postsSeen;
     if (result.aborted) {
-      if (this.plan?.testRun) day.testFailures = (day.testFailures || 0) + 1;
+      if (result.failureKind === "operator") {
+        if (!this.plan?.testRun) day.sessions = Math.max(0, day.sessions - 1);
+      } else if (this.plan?.testRun) day.testFailures = (day.testFailures || 0) + 1;
       else if (result.failureKind === "infra") {
         day.infraFailures = (day.infraFailures || 0) + 1;
         day.sessions = Math.max(0, day.sessions - 1);
@@ -277,7 +305,8 @@ export class Optimizer {
       testRun: Boolean(this.plan?.testRun),
       reasons: result.deniedReasons,
     };
-    this.state.history.push({ ...run, ...this.state.lastSession, outcome: result.aborted ? "failed" : "completed" });
+    const outcome = !result.aborted ? "completed" : result.failureKind === "operator" ? "interrupted" : "failed";
+    this.state.history.push({ ...run, ...this.state.lastSession, outcome });
     this.state.history = this.state.history.slice(-200);
     this.state.currentRun = null;
     this.state.optimizerNotes = [...(this.state.optimizerNotes || []), ...this.notes].slice(-80);

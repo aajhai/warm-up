@@ -18,7 +18,7 @@ const { config, sampleFlow, sampleGrowInvites, sampleSessionPlan } = await impor
 const { beginRun, weeklyBudget, reserveAction, rememberVisit, alreadyVisited, utcWeekKey, hasUncertainConnect, recoverInterruptedRun } = await import("../src/activity.js");
 const { accountSnapshotWorld, classifyAccount, inspectAccount } = await import("../src/scenario/accountGuard.js");
 const { inviteHoldReason, recordStillOffered, recordInviteLimit, nextIstMidnight, nextWeeklyReset } = await import("../src/inviteHold.js");
-const { networkDomWorld, runConnectionBatch, pickGrowCandidate } = await import("../src/scenario/linkedinNetwork.js");
+const { networkDomWorld, runConnectionBatch, pickGrowCandidate, scrollsBetweenInvites, leftMyNetwork, settleGrow, GROW_SETTLE_MS } = await import("../src/scenario/linkedinNetwork.js");
 const { profileDomWorld, readProfilePage, pickSearchQuery, rememberQuery, pickResultIndex, runSearch, profileConnect, normalizeQuery, visitCompanyFromProfile, verifyNeeds } = await import("../src/scenario/linkedinProfile.js");
 const { feedDomWorld, feedDomHelpers } = await import("../src/scenario/linkedinDom.js");
 const { Optimizer } = await import("../src/optimizer/reviewer.js");
@@ -89,45 +89,39 @@ test("Grow candidate selection is not first-visible-unused", () => {
   assert.equal(pickGrowCandidate(cards.slice(0, 3), { state, passed }).candidate, null);
 });
 
-test("invite count is 0-4, zero is the most common draw, and the batch is sometimes skipped", () => {
+test("invite count ceiling is 8, zero is the most common draw, and invites are split by scrolls", () => {
   assert.equal(sampleGrowInvites(0), 0);
-  assert.equal(sampleGrowInvites(0.9999), 4);
-  const counts = [0, 0, 0, 0, 0];
-  for (let i = 0; i < 5000; i += 1) counts[sampleGrowInvites()] += 1;
-  assert.equal(counts.length, 5);
+  assert.equal(sampleGrowInvites(0.9999), 8);
+  const counts = Array.from({ length: 9 }, () => 0);
+  for (let i = 0; i < 8000; i += 1) counts[sampleGrowInvites()] += 1;
   assert.ok(counts[0] === Math.max(...counts), `zero should be most common: ${counts}`);
-  assert.ok(counts[4] > 0 && counts[4] < counts[1]);
+  assert.ok(counts[8] > 0 && counts[1] > counts[8], `ceiling 8 is rare: ${counts}`);
+  assert.equal(scrollsBetweenInvites(() => 0), 1);
+  assert.equal(scrollsBetweenInvites(() => 0.5), 2);
+  assert.equal(scrollsBetweenInvites(() => 0.9), 3);
 });
 
-test("session flow varies: search share, visit counts, and step order are mixed", () => {
-  const orders = new Map();
-  let searches = 0;
-  let zeroVisits = 0;
-  let noGrow = 0;
-  const browseCounts = [];
+test("session flow is the feed, then My Network only when an invitation was drawn", () => {
+  let withGrow = 0;
+  let feedOnly = 0;
   for (let i = 0; i < 4000; i += 1) {
     const flow = sampleFlow();
-    const key = flow.order.join(">");
-    orders.set(key, (orders.get(key) || 0) + 1);
-    if (flow.search) searches += 1;
-    const browseVisits = flow.feedVisits + flow.growVisits;
-    assert.ok(browseVisits <= 3, `feed/grow visits ${browseVisits}`);
-    if (!browseVisits) zeroVisits += 1;
-    browseCounts.push(browseVisits);
-    if (!flow.order.includes("grow")) noGrow += 1;
-    assert.ok(flow.order.includes("feed"));
-    assert.ok(flow.inviteCount <= 4);
-    if (!flow.search) assert.equal(flow.searchConnect, false);
+    assert.equal(flow.search, false);
+    assert.equal(flow.searchCompany, false);
+    assert.equal(flow.searchConnect, false);
+    assert.equal(flow.feedVisits, 0);
+    assert.equal(flow.growVisits, 0);
+    assert.ok(flow.inviteCount <= 8);
+    assert.ok(flow.order[0] === "feed");
+    if (flow.inviteCount > 0) {
+      assert.deepEqual(flow.order, ["feed", "grow"]);
+      withGrow += 1;
+    } else {
+      assert.deepEqual(flow.order, ["feed"]);
+      feedOnly += 1;
+    }
   }
-  for (const key of ["search>feed>grow", "feed>search>grow", "feed>grow>search", "feed>grow", "feed", "search>feed", "feed>search"]) {
-    assert.ok(orders.get(key) > 0, `order ${key} should appear`);
-  }
-  assert.ok(searches / 4000 > 0.45 && searches / 4000 < 0.65, `search share ${searches}`);
-  assert.ok(zeroVisits > 0, "some sessions view no profiles");
-  assert.ok(zeroVisits / 4000 < 0.3, `zero-view share ${zeroVisits}`);
-  browseCounts.sort((a, b) => a - b);
-  assert.ok(browseCounts[2000] >= 1, "the median session views at least one profile or company");
-  assert.ok(noGrow > 0, "some sessions skip Grow entirely");
+  assert.ok(withGrow > 0 && feedOnly > 0, `grow ${withGrow} feed-only ${feedOnly}`);
 });
 
 test("test runs and connection trials never search, connect, follow, or view profiles", async () => {
@@ -179,9 +173,9 @@ test("planned steps run in the sampled order and a search before the feed shorte
     dwell: async (_p, ms) => { dwells.push(ms); },
   };
   const result = await runPlannedSteps({}, emptyState(), { order: ["search", "feed", "grow"], search: true, inviteCount: 2, growVisits: 1, sessionMs: 600_000 }, null, { steps });
-  assert.deepEqual(called, ["search", "feed", "grow:2:1"]);
-  assert.equal(feedMs, 450_000);
-  assert.equal(result.visits, 2);
+  assert.deepEqual(called, ["feed", "grow:2:1"]);
+  assert.equal(feedMs, 600_000);
+  assert.equal(result.visits, 1);
   assert.equal(result.connections, 1);
   assert.equal(dwells.length, 1);
   called.length = 0;
@@ -220,13 +214,16 @@ test("post-invite dwell is scheduled only when an invite was sent, for 60-180s, 
   const base = {
     feed: async () => ({ likes: 0, postsSeen: 9, aborted: false }),
     search: async () => ({ visits: 1, attempted: 1, connections: 1, sent: [{ confirmed: true }] }),
+    grow: async () => ({ connections: 1, attempted: 1, sent: [{ confirmed: true }] }),
     dwell: async (_p, ms) => { dwells.push(ms); },
   };
+  await runPlannedSteps({}, emptyState(), { order: ["feed", "grow"], inviteCount: 1, sessionMs: 600_000 }, null, { steps: base });
+  assert.equal(dwells.length, 1, "a My Network invite dwells");
   await runPlannedSteps({}, emptyState(), { order: ["feed", "search"], search: true, sessionMs: 600_000 }, null, { steps: base });
-  assert.equal(dwells.length, 1, "a profile invite from search also dwells");
-  await runPlannedSteps({}, emptyState(), { order: ["feed", "search"], search: true, sessionMs: 600_000 }, null, { steps: { ...base, search: async () => ({ visits: 1, attempted: 1, sent: [{ confirmed: true }], accountBlock: { kind: "checkpoint", reason: "checkpoint" } }) } });
+  assert.equal(dwells.length, 1, "search does not run, so a profile invite is not sent");
+  await runPlannedSteps({}, emptyState(), { order: ["feed", "grow"], inviteCount: 1, sessionMs: 600_000 }, null, { steps: { ...base, grow: async () => ({ connections: 1, attempted: 1, sent: [{ confirmed: true }], accountBlock: { kind: "checkpoint", reason: "checkpoint" } }) } });
   assert.equal(dwells.length, 1, "no lingering on a checkpoint");
-  await runPlannedSteps({}, emptyState(), { order: ["feed", "search"], search: true, sessionMs: 600_000 }, null, { steps: { ...base, search: async () => ({ visits: 1, attempted: 0, sent: [] }) } });
+  await runPlannedSteps({}, emptyState(), { order: ["feed"], inviteCount: 0, sessionMs: 600_000 }, null, { steps: base });
   assert.equal(dwells.length, 1, "zero invites, no dwell");
 });
 
@@ -509,9 +506,15 @@ test("Connect still offered after reload ends the batch and holds invites for th
   assert.equal(reserveAction(state, "connect", "https://www.linkedin.com/in/zed", { limit: 9, persist: () => {} }), null);
   assert.equal(shared.day.stillOffered.length, 1);
 
-  recordStillOffered(state, { now: new Date(Date.now() + 60_000) });
-  assert.equal(state.inviteHold.kind, "still_offered_week");
-  assert.equal(state.inviteHold.until, nextWeeklyReset(new Date(Date.now() + 60_000)).toISOString());
+  // A second still-offered this UTC week asks for a hold until the weekly reset. The longer
+  // hold wins: between IST midnight and the UTC Monday reset, the day hold already lasts longer.
+  const dayUntil = new Date(state.inviteHold.until).getTime();
+  const later = new Date(Date.now() + 60_000);
+  recordStillOffered(state, { now: later });
+  const weekUntil = nextWeeklyReset(later).getTime();
+  assert.equal(state.inviteHold.kind, weekUntil > dayUntil ? "still_offered_week" : "still_offered_day");
+  assert.equal(state.inviteHold.until, new Date(Math.max(weekUntil, dayUntil)).toISOString());
+  assert.equal(state.inviteSignals.filter((signal) => signal.kind === "still_offered").length, 2);
 
   shared.day.stillOffered.push("p2", "p3");
   assert.match(inviteHoldReason(emptyState(), new Date(), shared), /3 profiles/);
@@ -561,10 +564,9 @@ test("a known-not-sent invite does not become an uncertain_connection pause when
   // A later step throwing leaves the run for crash recovery, which is what the runner's catch mirrors.
   const steps = {
     feed: async () => ({ likes: 0, postsSeen: 9, aborted: false }),
-    grow: async () => grow,
-    search: async () => { const error = new Error("Target closed"); throw error; },
+    grow: async () => { throw new Error("Protocol error: Connection closed."); },
   };
-  await assert.rejects(runPlannedSteps(page, state, { order: ["feed", "grow", "search"], search: true, inviteCount: 2, sessionMs: 600_000 }, null, { steps }), /Target closed/);
+  await assert.rejects(runPlannedSteps(page, state, { order: ["feed", "grow"], inviteCount: 2, sessionMs: 600_000 }, null, { steps }), /Connection closed/);
   recoverInterruptedRun(state, () => {});
   assert.equal(state.pause, null, "limit notice was a refusal, not an uncertain invite");
   assert.equal(state.inviteHold.kind, "invitation_limit");
@@ -659,7 +661,7 @@ test("Grow never presses a page-wide Show more; it wheels the suggestions area",
   assert.equal(result.accountBlock, null);
 });
 
-test("a Grow profile view opens only the name link, clicks nothing on the profile, and returns to Grow", async () => {
+test("Grow does not open a profile even when views were requested", async () => {
   const { document, world } = networkWorld(`<nav><a href="/mynetwork/">My Network</a></nav>${TWO_CARDS}`);
   const link = document.querySelector("#amy a");
   document.elementFromPoint = () => link;
@@ -698,12 +700,13 @@ test("a Grow profile view opens only the name link, clicks nothing on the profil
     onHeartbeat: () => { beats += 1; },
     readProfile: async (p, opts) => { reads.push(p.url()); opts.onHeartbeat(); },
   });
-  assert.deepEqual(pressed, ["A", "NAV"]);
-  assert.deepEqual(reads, ["https://www.linkedin.com/in/amy"]);
-  assert.equal(result.visits, 1);
+  assert.deepEqual(pressed, []);
+  assert.deepEqual(reads, []);
+  assert.equal(result.visits, 0);
+  assert.equal(result.attempted, 0);
   assert.equal(result.accountBlock, null);
   assert.equal(url, "https://www.linkedin.com/mynetwork/grow/");
-  assert.ok(beats > 0);
+  assert.equal(beats, 0);
 });
 
 test("inspectAccount ignores 'unusual activity' and 'enter the code' in posts, headlines, and results", async () => {
@@ -891,6 +894,47 @@ const VISIT_RECTS = {
   "update-card-ad": box(1000, 360, 400, 150), author3: box(1010, 380, 100, 20), like3: box(1010, 470, 80, 30), c3: box(1100, 470, 80, 30),
 };
 
+test("an expanded card and its focus card are the same post", () => {
+  const card = (key) => `<main><div data-testid="mainFeed" data-rect="feed"><div componentkey="${key}"><p>Same post body long enough to count.</p><button data-rect="like" aria-label="Like">Like</button></div></div></main>`;
+  const rects = { feed: box(288, 0, 400, 2000), [""]: box(0, 0, 0, 0) };
+  const expandedKey = "expandedABC123FeedType_MAIN_FEED_RELEVANCE";
+  const focusKey = "update-card-focusABC123FeedType_MAIN_FEED_RELEVANCE";
+  rects[expandedKey] = box(288, 180, 400, 220);
+  rects[focusKey] = box(288, 180, 400, 220);
+  const expanded = feedWorld(card(expandedKey), rects).collect()[0];
+  const focus = feedWorld(card(focusKey), rects).collect()[0];
+  assert.equal(expanded.urn, focus.urn);
+  assert.equal(expanded.urn, "ABC123FeedType_MAIN_FEED_RELEVANCE");
+});
+
+test("a feed video exposes a mute control and the probe accepts only that button", () => {
+  const html = `<main><div data-testid="mainFeed" data-rect="feed">
+    <div componentkey="update-card-video">
+      <a data-rect="author" href="/in/kunal/">Kunal</a>
+      <p>A video post with enough text to be a real update on the home feed today.</p>
+      <video data-rect="vid"></video>
+      <button data-rect="mute" aria-label="Unmute">Unmute</button>
+      <button data-rect="like" aria-label="Reaction button state: no reaction Like">Like</button>
+    </div>
+  </div></main>`;
+  const world = feedWorld(html, {
+    feed: box(288, 0, 400, 2000),
+    "update-card-video": box(288, 180, 400, 420),
+    author: box(300, 190, 80, 20),
+    vid: box(300, 230, 360, 200),
+    mute: box(310, 400, 36, 36),
+    like: box(300, 540, 80, 30),
+  });
+  const [post] = world.collect();
+  assert.equal(post.hasVideo, true);
+  assert.equal(post.hasMute, true);
+  const point = world.locate(post.urn, "mute");
+  assert.ok(point);
+  assert.equal(world.probe(point.x, point.y, "mute", post.urn).safe, true);
+  const like = world.locate(post.urn, "like");
+  assert.equal(world.probe(like.x, like.y, "mute", post.urn).safe, false);
+});
+
 test("feed views target post authors and person module rows; ads, company rows, Follow, and Show more are excluded", () => {
   const world = feedWorld(VISIT_FEED, VISIT_RECTS);
   const targets = world.visitTargets();
@@ -914,79 +958,21 @@ test("feed views target post authors and person module rows; ads, company rows, 
   assert.equal(world.probe(author.x, author.y, "follow", author.url).safe, false);
 });
 
-test("a feed view is stored before navigating and never repeats a URL", async () => {
-  const state = productionState();
-  const target = { url: "https://www.linkedin.com/in/christian-meram/", source: "post", kind: "person", x: 350, y: 380 };
-  let url = "https://www.linkedin.com/feed/";
+test("the feed refuses profile views even when a plan asks for them", async () => {
   let clicks = 0;
-  const page = {
-    url: () => url,
-    goBack: async () => { throw new Error("Browser Back is never used"); },
-    evaluate: async (fn, _w, _h, name) => {
-      if (name === "visitTargets") return [target];
-      if (typeof fn === "function" && !name && fn.toString().includes('"/feed"')) return { x: 40, y: 20 };
-      return typeof fn === "function" && !name ? { text: "", feedPresent: true } : null;
-    },
-  };
   const human = {
-    revealControl: async () => ({ x: target.x, y: target.y }),
-    clickAt: async (_x, _y, kind, urn, opts) => {
-      if (kind === "home") { url = "https://www.linkedin.com/feed/"; return true; }
-      assert.equal(kind, "visit");
-      assert.equal(urn, target.url);
-      assert.equal(opts.singlePress, true);
-      assert.ok(alreadyVisited(state, target.url), "stored before the click");
-      clicks += 1;
-      url = target.url;
-      return true;
-    },
+    revealControl: async () => { clicks += 1; return { x: 1, y: 1 }; },
+    clickAt: async () => { clicks += 1; return true; },
   };
-  const optimizer = { state, plan: { feedVisits: 2, warmupMs: 0, windDownMs: 0 } };
+  const optimizer = { state: productionState(), plan: { feedVisits: 3, verify: true, searchConnect: true, warmupMs: 0, windDownMs: 0 } };
   const stats = { feedVisits: 0 };
-  const ctx = { started: 0, endsAt: Date.now() + 10 * 60_000, read: async () => {}, rng: () => 0 };
-  const first = await maybeVisitFromFeed(page, human, optimizer, stats, ctx);
-  assert.equal(first.visited, true);
-  assert.equal(url, "https://www.linkedin.com/feed/");
-  const second = await maybeVisitFromFeed(page, human, optimizer, stats, ctx);
-  assert.equal(second.visited, false);
-  assert.equal(clicks, 1);
-});
-
-test("a feed view returns through the Home nav, not Browser Back into a proxy error page", async () => {
-  const state = productionState();
-  const target = { url: "https://www.linkedin.com/in/sandeep/", source: "post", kind: "person", x: 350, y: 380 };
-  let url = "https://www.linkedin.com/feed/";
-  let backs = 0;
-  const page = {
-    url: () => url,
-    goBack: async () => { backs += 1; url = "chrome-error://chromewebdata/"; throw new Error("Navigation timeout of 15000 ms exceeded"); },
-    reload: async () => {},
-    evaluate: async (fn, _w, _h, name) => {
-      if (name === "visitTargets") return [target];
-      if (typeof fn === "function" && !name && fn.toString().includes('"/feed"')) return url.startsWith("chrome-error") ? null : { x: 40, y: 20 };
-      return typeof fn === "function" && !name ? { text: "", feedPresent: true } : null;
-    },
-  };
-  const presses = [];
-  const human = {
-    revealControl: async () => ({ x: target.x, y: target.y }),
-    clickAt: async (_x, _y, kind) => {
-      presses.push(kind);
-      url = kind === "visit" ? target.url : "https://www.linkedin.com/feed/";
-      return true;
-    },
-  };
-  let beats = 0;
-  const optimizer = { state, plan: { feedVisits: 1, warmupMs: 0, windDownMs: 0 } };
-  const visit = await maybeVisitFromFeed(page, human, optimizer, { feedVisits: 0 }, {
-    started: 0, endsAt: Date.now() + 10 * 60_000, rng: () => 0, read: async () => {}, onHeartbeat: () => { beats += 1; },
+  const visit = await maybeVisitFromFeed({ url: () => "https://www.linkedin.com/feed/" }, human, optimizer, stats, {
+    started: 0, endsAt: Date.now() + 10 * 60_000, rng: () => 0, visitChance: 1,
   });
-  assert.equal(visit.visited, true);
-  assert.equal(visit.returned, true);
-  assert.deepEqual(presses, ["visit", "home"]);
-  assert.equal(backs, 0, "Home nav is tried before Browser Back");
-  assert.equal(url, "https://www.linkedin.com/feed/");
-  assert.ok(beats > 0);
+  assert.equal(visit.visited, false);
+  assert.equal(visit.reason, "profile-views-disabled");
+  assert.equal(clicks, 0);
+  assert.equal(stats.feedVisits, 0);
 });
 
 test("old state files without the new fields still load, and invalid new fields fail closed", () => {
@@ -1008,7 +994,7 @@ test("old state files without the new fields still load, and invalid new fields 
   assert.throws(() => loadState(), /searchQueries/);
 });
 
-test("preflight drops invites while a hold is active but keeps views", () => {
+test("preflight drops invites while a hold is active and still does not open profiles", () => {
   const state = emptyState();
   state.inviteHold = { kind: "still_offered_day", reason: "x", at: new Date().toISOString(), until: new Date(Date.now() + 3600_000).toISOString() };
   for (let i = 0; i < 50; i += 1) {
@@ -1145,55 +1131,21 @@ test("a chrome-error return does not use Back, abort the session, or pause the p
   const result = await runPlannedSteps({}, planState, { order: ["search", "feed", "grow"], search: true, inviteCount: 1, sessionMs: 600_000 }, null, { steps });
   assert.equal(result.aborted, false, "a failed return and a failed Grow navigation leave the session running");
   assert.equal(result.accountBlock, undefined);
-  assert.equal(result.searchReturned, false);
+  assert.equal(result.searchOpened, false);
+  assert.equal(result.searchReturned, null);
   assert.equal(planState.pause, null);
 });
 
-test("a verification feed visit opens a company page, reads it, and clicks nothing on it", async () => {
-  const state = productionState();
-  const targets = [
-    { url: "https://www.linkedin.com/in/christian-meram/", source: "post", kind: "person", x: 350, y: 380 },
-    { url: "https://www.linkedin.com/company/acme/", source: "post", kind: "company", x: 350, y: 600 },
-  ];
-  let url = "https://www.linkedin.com/feed/";
-  const page = {
-    url: () => url,
-    goBack: async () => { throw new Error("Browser Back is never used"); },
-    evaluate: async (fn, _w, _h, name) => {
-      if (name === "visitTargets") return targets;
-      if (typeof fn === "function" && !name && fn.toString().includes('"/feed"')) return { x: 40, y: 20 };
-      return typeof fn === "function" && !name ? { text: "", feedPresent: true } : null;
-    },
-  };
-  const presses = [];
-  const human = {
-    revealControl: async (target) => targets.find((t) => t.url === target),
-    clickAt: async (_x, _y, kind, urn) => {
-      if (/\/company\//.test(url) && kind !== "home") throw new Error("nothing on a company page is clicked");
-      presses.push(kind);
-      url = kind === "home" ? "https://www.linkedin.com/feed/" : urn;
-      return true;
-    },
-  };
-  const companyPage = {
-    url: () => "https://www.linkedin.com/company/acme/",
-    mouse: { move: async () => {}, wheel: async () => {}, click: async () => { throw new Error("no click on a company page"); } },
-    keyboard: { press: async () => { throw new Error("no keys"); } },
-    evaluate: async () => { throw new Error("no DOM clicks"); },
-  };
-  const reads = [];
-  const optimizer = { state, plan: { verify: true, feedVisits: 3, warmupMs: 0, windDownMs: 0 } };
-  const stats = { feedVisits: 0 };
-  const visit = await maybeVisitFromFeed(page, human, optimizer, stats, {
-    started: 0, endsAt: Date.now() + 10 * 60_000, rng: () => 0, visitChance: 0.01,
-    read: async (p) => { reads.push(p.url()); await readProfilePage(companyPage, { pause: noPause }); },
+test("verification does not open a company or person page from the feed", async () => {
+  let clicks = 0;
+  const visit = await maybeVisitFromFeed({ url: () => "https://www.linkedin.com/feed/" }, {
+    revealControl: async () => { clicks += 1; return { x: 1, y: 1 }; },
+    clickAt: async () => { clicks += 1; return true; },
+  }, { state: productionState(), plan: { verify: true, feedVisits: 3, warmupMs: 0, windDownMs: 0 } }, { feedVisits: 0 }, {
+    started: 0, endsAt: Date.now() + 10 * 60_000, rng: () => 0, visitChance: 1,
   });
-  assert.equal(visit.visited, true);
-  assert.equal(visit.url, "https://www.linkedin.com/company/acme/", "verification takes the company first");
-  assert.deepEqual(presses, ["visit", "home"]);
-  assert.deepEqual(reads, ["https://www.linkedin.com/company/acme/"]);
-  assert.equal(stats.companyVisits, 1);
-  assert.equal(url, "https://www.linkedin.com/feed/");
+  assert.equal(visit.visited, false);
+  assert.equal(clicks, 0);
 });
 
 test("profile Connect ignores a search-results row Connect and a list Connect outside the top card", async () => {
@@ -1317,40 +1269,33 @@ test("a company view can come from an open person profile and clicks only the co
   assert.ok(alreadyVisited(state, "https://www.linkedin.com/company/acme/"));
 });
 
-test("VERIFY_WARMUP forces the checklist; production plans stay random", () => {
-  const random = Array.from({ length: 400 }, () => new Optimizer(emptyState()).preflight().plan);
-  assert.ok(random.some((p) => !p.search) && random.some((p) => p.search));
+test("production and verification plans never open profiles or connect off My Network", () => {
+  const random = Array.from({ length: 200 }, () => new Optimizer(emptyState()).preflight().plan);
+  assert.ok(random.every((p) => !p.search && !p.searchConnect && p.feedVisits === 0 && p.growVisits === 0 && !p.verify));
   assert.ok(random.some((p) => p.inviteCount === 0));
-  assert.ok(random.every((p) => !p.verify));
-  const sorted = random.map((p) => (p.feedVisits || 0) + (p.growVisits || 0) + (p.search ? 1 : 0)).sort((a, b) => a - b);
-  assert.ok(sorted[Math.floor(sorted.length / 2)] >= 1, "median session views a profile or company");
+  assert.ok(random.some((p) => p.order.includes("grow")));
+  assert.ok(random.every((p) => p.order[0] === "feed" && !p.order.includes("search")));
   config.verifyWarmup = true;
   try {
     const plan = new Optimizer(emptyState()).preflight().plan;
     assert.equal(plan.verify, true);
-    assert.deepEqual(plan.order, ["search", "feed", "grow"]);
-    assert.ok(plan.search && plan.searchCompany && plan.searchConnect);
-    assert.ok(plan.inviteCount >= 1 && plan.inviteCount <= config.growInviteHardCap);
+    assert.equal(plan.search, false);
+    assert.equal(plan.searchConnect, false);
+    assert.equal(plan.feedVisits, 0);
+    assert.equal(plan.growVisits, 0);
+    assert.ok(!plan.order.includes("search"));
     assert.ok(plan.followCap >= 1 && plan.followCap <= 2);
-    assert.ok(plan.feedVisits >= 1);
   } finally { config.verifyWarmup = false; }
 });
 
-test("production plans connect from search on a minority of searches; VERIFY_WARMUP still may", () => {
-  let searches = 0;
-  let connects = 0;
-  for (let i = 0; i < 6000; i += 1) {
+test("connection requests are never planned from search", () => {
+  for (let i = 0; i < 200; i += 1) {
     const flow = sampleFlow();
-    if (!flow.search) { assert.equal(flow.searchConnect, false); continue; }
-    searches += 1;
-    if (flow.searchConnect) connects += 1;
+    assert.equal(flow.searchConnect, false);
+    assert.equal(flow.search, false);
   }
-  const share = connects / searches;
-  assert.ok(share > 0.12 && share < 0.3, `search-connect share ${share.toFixed(3)} should be about 1 in 5`);
-  const plans = Array.from({ length: 600 }, () => new Optimizer(productionState()).preflight().plan).filter((p) => p.search);
-  assert.ok(plans.filter((p) => p.searchConnect).length / plans.length < 0.35, "production preflight does not connect on every search");
   config.verifyWarmup = true;
-  try { assert.equal(new Optimizer(productionState()).preflight().plan.searchConnect, true); }
+  try { assert.equal(new Optimizer(productionState()).preflight().plan.searchConnect, false); }
   finally { config.verifyWarmup = false; }
 });
 
@@ -1437,4 +1382,186 @@ test("tests never write the repo log file", () => {
   assert.ok(!logFile.startsWith(join(repo, "logs")), logFile);
   assert.ok(sampleSessionPlan().order.includes("feed"));
   assert.equal(utcWeekKey(new Date("2026-09-27T12:00:00Z")), "2026-09-21");
+});
+
+test("SESSION_MINUTES overrides production session length and is validated", () => {
+  const saved = process.env.SESSION_MINUTES;
+  try {
+    process.env.SESSION_MINUTES = "5,10";
+    for (let i = 0; i < 200; i += 1) {
+      const { sessionMs } = sampleSessionPlan();
+      assert.ok(sessionMs >= 5 * 60_000 && sessionMs <= 10 * 60_000, String(sessionMs));
+    }
+    for (const bad of ["10,5", "0,5", "5,21", "5", "a,b"]) {
+      process.env.SESSION_MINUTES = bad;
+      assert.throws(() => sampleSessionPlan(), /SESSION_MINUTES must be two integers/);
+    }
+    delete process.env.SESSION_MINUTES;
+    assert.ok(sampleSessionPlan().sessionMs >= config.sessionMinutes.min * 60_000);
+  } finally {
+    if (saved === undefined) delete process.env.SESSION_MINUTES;
+    else process.env.SESSION_MINUTES = saved;
+  }
+});
+
+
+test("Gaurav: the recheck after a Grow reload waits for the cards before deciding", async () => {
+  const { document, world } = networkWorld(TWO_CARDS);
+  const amy = document.querySelector("#amy button");
+  document.elementFromPoint = () => amy;
+  let reloaded = false;
+  let readyCalls = 0;
+  const slowGrow = {
+    ...world,
+    growReady: () => {
+      if (reloaded && (readyCalls += 1) === 3) {
+        document.querySelector("main").innerHTML = '<li id="ben"><a href="https://www.linkedin.com/in/ben">Ben Example</a><button>Connect</button></li>';
+        for (const el of document.querySelectorAll("*")) el.getBoundingClientRect = () => ({ x: 300, y: 150, top: 150, bottom: 190, width: 120, height: 40 });
+      }
+      return world.growReady();
+    },
+  };
+  const { page, calls } = growPage(slowGrow, {
+    onReload: () => { reloaded = true; document.querySelector("main").innerHTML = ""; },
+  });
+  const state = productionState();
+  const result = await runConnectionBatch(page, state, { maxAttempts: 1, pause: noPause, gapRange: [0, 0], pickCandidate: firstCard, shared: fakeShared() });
+  assert.equal(calls.reloads, 1);
+  assert.ok(readyCalls >= 3, "the cards were awaited after the reload");
+  assert.equal(result.accountBlock, null, "a re-rendered Grow without the invitee is not an uncertain invite");
+  assert.equal(result.sent[0].confirmed, true);
+});
+
+test("a Grow page that never re-renders after the recheck keeps the uncertain-invite pause", async () => {
+  const { document, world } = networkWorld(TWO_CARDS);
+  const amy = document.querySelector("#amy button");
+  document.elementFromPoint = () => amy;
+  const { page } = growPage(world, { onReload: () => { document.querySelector("main").innerHTML = ""; } });
+  const state = productionState();
+  const result = await runConnectionBatch(page, state, { maxAttempts: 1, pause: noPause, gapRange: [0, 0], pickCandidate: firstCard, shared: fakeShared() });
+  assert.equal(result.accountBlock?.kind, "uncertain_connection");
+  assert.equal(hasUncertainConnect(state, state.currentRun.id), true);
+});
+
+test("a Pending card with mutual-connection links is still matched to the invitee", () => {
+  const { world } = networkWorld(`<main>
+    <li id="amy"><div><a href="https://www.linkedin.com/in/amy">Amy Example</a><span><a href="https://www.linkedin.com/in/mutual-one">M1</a> and <a href="https://www.linkedin.com/in/mutual-two">M2</a> are mutual connections</span></div><button aria-label="Pending, click to withdraw invitation sent to Amy Example">Pending</button></li>
+    <li id="ben"><a href="https://www.linkedin.com/in/ben">Ben Example</a><button>Connect</button></li>
+  </main>`);
+  assert.equal(world.pending({ url: "https://www.linkedin.com/in/amy" }), true);
+  assert.equal(world.pending({ url: "https://www.linkedin.com/in/ben" }), false);
+  assert.equal(world.pending({ url: "https://www.linkedin.com/in/mutual-one" }), false, "a mutual connection is not the invitee");
+});
+
+test("leaving My Network pauses only when an invite outcome is unknown or the page is off LinkedIn", async () => {
+  const at = (href, extra = {}) => ({ url: () => href, ...extra });
+  const clean = productionState();
+  const onFeed = await leftMyNetwork(at("https://www.linkedin.com/feed/"), clean);
+  assert.equal(onFeed.action, "end");
+  assert.match(onFeed.reason, /\/feed\//);
+  assert.equal((await leftMyNetwork(at("https://evil.example/"), clean)).action, "pause");
+  const swapped = at("https://www.linkedin.com/mynetwork/grow/");
+  assert.equal((await leftMyNetwork(swapped, clean)).action, "continue");
+
+  const uncertain = productionState();
+  weeklyBudget(uncertain);
+  reserveAction(uncertain, "connect", "https://www.linkedin.com/in/zed", { limit: 1, persist: () => {} });
+  assert.equal((await leftMyNetwork(at("https://www.linkedin.com/feed/"), uncertain)).action, "pause");
+});
+
+
+function manyCards(count) {
+  const names = Array.from({ length: count }, (_, i) => `Person${i} Example`);
+  const html = `<main>${names.map((name, i) => `<li id="p${i}"><a href="https://www.linkedin.com/in/person${i}">${name}</a><button>Connect</button></li>`).join("")}</main>`;
+  const built = networkWorld(html);
+  const nextConnect = () => [...built.document.querySelectorAll("main button")].find((b) => b.textContent === "Connect");
+  built.document.elementFromPoint = () => nextConnect() || null;
+  const onClick = () => {
+    const button = nextConnect();
+    const name = button.parentElement.querySelector("a").textContent;
+    button.textContent = "Pending";
+    button.setAttribute("aria-label", `Pending, click to withdraw invitation sent to ${name}`);
+  };
+  return { ...built, onClick };
+}
+
+test("Grow under a short time budget sends fewer invites and never shortens the human gap", async () => {
+  const { world, onClick } = manyCards(9);
+  const start = Date.now();
+  let now = start;
+  const pressedAt = [];
+  const { page } = growPage(world, { onClick: () => { pressedAt.push(now); onClick(); } });
+  const state = productionState();
+  const result = await runConnectionBatch(page, state, {
+    maxAttempts: 7, maxDurationMs: 150_000, gapRange: [25_000, 60_000], pickCandidate: firstCard, shared: fakeShared(),
+    pause: async (ms) => { now += Number(ms) || 0; }, clock: () => now,
+  });
+  assert.ok(result.attempted >= 1 && result.attempted < 7, `attempted ${result.attempted}`);
+  assert.match(result.reason || "", /time budget/);
+  assert.equal(result.accountBlock, null);
+  for (let i = 1; i < pressedAt.length; i += 1) assert.ok(pressedAt[i] - pressedAt[i - 1] >= 25_000, "gaps stay at least 25s");
+  assert.ok(now - start <= 150_000, `Grow used ${Math.round((now - start) / 1000)}s of a 150s budget`);
+});
+
+test("Grow waits for the cards to paint and settles 1.5-4s before the first scroll", async () => {
+  const events = [];
+  let readyCalls = 0;
+  const ready = [{ rendered: false }, { rendered: true, people: 8, cardControls: 6 }, { rendered: true, people: 11, cardControls: 9 }, { rendered: true, people: 11, cardControls: 9 }];
+  const page = { evaluate: async (_fn, _src, method) => (method === "growReady" ? ready[Math.min(readyCalls++, ready.length - 1)] : null) };
+  await settleGrow(page, { pause: async (ms) => { events.push(ms); } });
+  assert.equal(readyCalls, 4, "polled until two identical painted samples");
+  const settle = events.at(-1);
+  assert.ok(settle >= GROW_SETTLE_MS[0] && settle <= GROW_SETTLE_MS[1], `settle ${settle}`);
+
+  const { document, world } = networkWorld(TWO_CARDS);
+  document.elementFromPoint = () => document.querySelector("#amy button");
+  const order = [];
+  const { page: grow } = growPage(world);
+  const wheel = grow.mouse.wheel;
+  grow.mouse.wheel = async (...args) => { order.push("wheel"); return wheel(...args); };
+  await runConnectionBatch(grow, productionState(), {
+    maxAttempts: 1, gapRange: [0, 0], pickCandidate: firstCard, shared: fakeShared(),
+    pause: async (ms) => { if (ms >= GROW_SETTLE_MS[0] && ms <= GROW_SETTLE_MS[1]) order.push("settle"); },
+  });
+  assert.ok(order.indexOf("settle") >= 0 && order.indexOf("settle") < order.indexOf("wheel"), order.join(","));
+});
+
+const { growCardsPainted } = await import("../src/scenario/linkedinNetwork.js");
+
+test("Banwari: one person link and no card controls is not a painted Grow page", async () => {
+  assert.equal(growCardsPainted({ rendered: true, people: 1, cardControls: 0 }), false);
+  assert.equal(growCardsPainted({ rendered: true, people: 13, cardControls: 10 }), true);
+  let polls = 0;
+  const pauses = [];
+  const page = { evaluate: async (_fn, _src, method) => (method === "growReady" ? (polls += 1, { rendered: true, people: 1, cardControls: 0 }) : null) };
+  const ready = await settleGrow(page, { pause: async (ms) => { pauses.push(ms); }, polls: 6 });
+  assert.equal(polls, 6, "two identical empty samples do not count as settled");
+  assert.equal(ready.people, 1);
+  const settle = pauses.at(-1);
+  assert.ok(settle >= GROW_SETTLE_MS[0] && settle <= GROW_SETTLE_MS[1], "still settles before proceeding carefully");
+});
+
+test("Mohit: Grow input that never acknowledges is bounded and the batch ends with a reason, not silence", async () => {
+  const { document, world } = networkWorld("<main><p>No suggestions</p></main>");
+  document.elementFromPoint = () => null;
+  const { page } = growPage(world);
+  page.mouse.move = () => new Promise(() => {});
+  page.mouse.wheel = () => new Promise(() => {});
+  const startedAt = Date.now();
+  const result = await runConnectionBatch(page, productionState(), {
+    maxAttempts: 1, maxDurationMs: 90_000, gapRange: [0, 0], shared: fakeShared(), pause: noPause, inputTimeoutMs: 20,
+  });
+  assert.ok(Date.now() - startedAt < 10_000, "hung pointer input did not wait out the protocol timeout");
+  assert.equal(result.attempted, 0);
+  assert.ok(result.reason, "the reason is recorded");
+
+  const later = networkWorld(TWO_CARDS);
+  later.document.elementFromPoint = () => later.document.querySelector("#amy button");
+  let now = Date.now();
+  const { page: slow } = growPage(later.world);
+  const out = await runConnectionBatch(slow, productionState(), {
+    maxAttempts: 1, maxDurationMs: 20_000, gapRange: [0, 0], pickCandidate: () => ({ candidate: null, skipped: [] }), shared: fakeShared(),
+    pause: async (ms) => { now += Number(ms) || 0; }, clock: () => now,
+  });
+  assert.match(out.reason || "", /time budget|No unambiguous|suggestion/);
 });

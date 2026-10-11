@@ -4,6 +4,8 @@ export const INVITE_LIMIT_RE = /weekly invitation limit|reached.{0,50}invitation
 const RESTRICTION_RE = /account (?:has been |is )?(?:temporarily |permanently )?restricted|access to your account has been restricted/i;
 const CHALLENGE_RE = /verify you.?re a real person|unusual activity|security checkpoint|enter the code/i;
 const LOGIN_TEXT_RE = /sign in to linkedin|join linkedin|agree & join/i;
+// linkedin.com/hp is the logged-out home page; a signed-in browser is sent to /feed/.
+const LOGGED_OUT_HOME_RE = /^\/hp(?:\/|$)/i;
 
 // `overlayText` comes only from dialogs, alerts, and toasts. `bodyText` is only supplied when
 // the page has no LinkedIn nav (a bare interstitial), so posts, headlines, and search results
@@ -22,7 +24,7 @@ export function classifyAccount(url, overlayText = "", chromePresent = false, bo
   const bare = chromePresent ? "" : bodyText;
   if (RESTRICTION_RE.test(overlayText) || RESTRICTION_RE.test(bare)) return { kind: "restriction", reason: "LinkedIn account restriction" };
   if (CHALLENGE_RE.test(overlayText)) return { kind: "challenge", reason: "LinkedIn requests identity verification" };
-  if (/authwall|\/login|\/signup|\/uas\//i.test(path)) return { kind: "login", reason: "LinkedIn login required" };
+  if (/authwall|\/login|\/signup|\/uas\//i.test(path) || LOGGED_OUT_HOME_RE.test(path)) return { kind: "login", reason: "LinkedIn login required" };
   if (!chromePresent && (LOGIN_TEXT_RE.test(overlayText) || LOGIN_TEXT_RE.test(bare))) return { kind: "login", reason: "LinkedIn login required" };
   return null;
 }
@@ -56,4 +58,38 @@ export function pauseForAccount(state, block, now = new Date()) {
     ...block, at: now.toISOString(),
     cooldownUntil: ["challenge", "restriction"].includes(block.kind) ? new Date(now.getTime() + 48 * 3600_000).toISOString() : null,
   };
+}
+
+// An account wall read from a URL alone (no frame needed): login, authwall, signup, the
+// logged-out /hp home, or a checkpoint. Non-LinkedIn and ordinary LinkedIn pages return null.
+export function accountBlockFromUrl(url) {
+  let parsed;
+  try { parsed = new URL(String(url || "")); } catch { return null; }
+  if (parsed.hostname !== "www.linkedin.com" && parsed.hostname !== "linkedin.com") return null;
+  const block = classifyAccount(parsed.href, "", true, "");
+  return block && ["login", "challenge"].includes(block.kind) ? block : null;
+}
+
+// Every URL the browser reports: the working page's cached URL and each page target's URL.
+// Target listings keep working after the page's frame has detached.
+export async function observedAccountBlock(browser, page = null) {
+  const urls = [];
+  try { if (typeof page?.url === "function") urls.push(page.url()); } catch { /* detached */ }
+  try {
+    const targets = typeof browser?.targets === "function" ? await browser.targets() : [];
+    for (const target of targets || []) {
+      try { if (!target.type || target.type() === "page") urls.push(target.url()); } catch { /* gone */ }
+    }
+  } catch { /* browser gone */ }
+  try {
+    const pages = typeof browser?.pages === "function" ? await browser.pages() : [];
+    for (const tab of pages || []) {
+      try { urls.push(tab.url()); } catch { /* detached */ }
+    }
+  } catch { /* browser gone */ }
+  for (const url of urls) {
+    const block = accountBlockFromUrl(url);
+    if (block) return { ...block, url };
+  }
+  return null;
 }

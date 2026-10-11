@@ -135,6 +135,20 @@ export function beginRun(state, plan, now = new Date(), persist = saveState) {
   return state.currentRun;
 }
 
+// Undoes beginRun when GoLogin was unreachable before any browser opened. Refuses once
+// the run has reserved an action, so a budget-consuming run is never erased.
+export function abandonRun(state, runId, persist = saveState) {
+  const run = state.currentRun;
+  if (!run || run.id !== runId) return false;
+  if (state.actions.some((action) => action.runId === runId)) return false;
+  const day = getDayStats(state, run.dayKey);
+  if (run.testRun) day.testRuns = Math.max(0, day.testRuns - 1);
+  else day.sessions = Math.max(0, day.sessions - 1);
+  state.currentRun = null;
+  persist(state);
+  return true;
+}
+
 export function recoverInterruptedRun(state, persist = saveState) {
   if (!state.currentRun) return false;
   const run = state.currentRun;

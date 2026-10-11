@@ -1,5 +1,7 @@
 import { config, sampleGrowInvites } from "../config.js";
-import { alreadyAttempted, alreadyVisited, finishAction, finishActionNotSent, rememberVisit, reserveAction, weeklyBudget } from "../activity.js";
+import { alreadyAttempted, alreadyVisited, finishAction, finishActionNotSent, hasUncertainConnect, rememberVisit, reserveAction, weeklyBudget } from "../activity.js";
+import { isDetachedFrameError, isRestoredTab } from "../browser/page.js";
+import { INVITE_WORK_MS } from "../sessionBudget.js";
 import { inviteHoldReason, loadSharedDay, recordInviteLimit, recordStillOffered } from "../inviteHold.js";
 import { saveState } from "../sessionState.js";
 import { INVITE_LIMIT_RE, inspectAccount } from "./accountGuard.js";
@@ -17,7 +19,8 @@ export function networkDomWorld() {
   };
   const visible = (el) => {
     const r = el.getBoundingClientRect();
-    return onscreen(el) && r.top >= 40 && r.bottom > 80;
+    const mid = r.top + r.height / 2;
+    return onscreen(el) && mid >= 80 && mid <= innerHeight - 80;
   };
   const label = (el) => (el.innerText || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
   const controls = (root) => [...(root || document).querySelectorAll("button, [role='button']")];
@@ -147,15 +150,31 @@ export function networkDomWorld() {
     const button = document.elementFromPoint(x, y)?.closest("button");
     return Boolean(button && /^send without (?:a )?note$/i.test(label(button)) && button.closest('[role="dialog"], dialog[open]'));
   }
+  // After a press the card has no Connect button left, and Grow cards often link several
+  // people (mutual connections), so personCard's "one link or one Connect" rule misses the
+  // real card, and climbing to <main> can pair another card's Pending with this invitee.
+  // The card is the smallest ancestor below <main> that links the invitee; it must hold
+  // exactly one action control, and that control must be this Pending button.
+  function sentCardFor(el, url) {
+    const invitee = personName(((el.getAttribute("aria-label") || "").match(/(?:sent to|invitation to)\s+(.+?)\s*$/i) || [])[1] || "");
+    let node = el.parentElement;
+    for (let depth = 0; node && depth < 12 && node.tagName !== "MAIN" && node.tagName !== "BODY"; depth += 1, node = node.parentElement) {
+      const links = queryAll(node, "a[href]")
+        .map((link) => ({ url: canonical(link.getAttribute("href") || link.href), name: personName(link.innerText || link.textContent || "") }))
+        .filter((link) => link.url);
+      if (!links.some((link) => link.url === url)) continue;
+      const actions = controls(node).filter((c) => connect(c) || isSentControl(c));
+      if (actions.length !== 1 || actions[0] !== el) return false;
+      // Mutual-connection links share the card; the invitee is the named person, else the first link.
+      if (invitee) return links.some((link) => link.url === url && link.name && samePerson(link.name, invitee));
+      return links[0].url === url;
+    }
+    return false;
+  }
   function pending({ url }) {
     const root = document.querySelector("main");
     if (!root) return false;
-    for (const el of controls(root)) {
-      if (!isSentControl(el)) continue;
-      const card = personCard(el, url);
-      if (card?.url === url) return true;
-    }
-    return false;
+    return controls(root).some((el) => isSentControl(el) && sentCardFor(el, url));
   }
   function offered({ url }) {
     return candidates().some((c) => c.url === url);
@@ -399,7 +418,7 @@ export async function networkDom(page, method, arg = {}) {
 }
 
 function detachedFrameError(error) {
-  return /detached Frame|Execution context was destroyed|Execution context is not available/i.test(error?.message || "");
+  return isDetachedFrameError(error);
 }
 
 function safeUrl(page) {
@@ -426,6 +445,7 @@ async function adoptLivePage(page) {
     throw error;
   }
   const live = tabs
+    .filter((tab) => !isRestoredTab(tab))
     .map((tab) => ({ tab, url: safeUrl(tab) }))
     .filter((item) => item.url && /linkedin\.com/i.test(item.url));
   return live.find((item) => /\/mynetwork/i.test(item.url))?.tab || live[0]?.tab || page;
@@ -472,12 +492,6 @@ async function clickPoint(page, point, pause, { navigation = false } = {}) {
   return true;
 }
 
-async function existingGrowTab(page) {
-  const browser = typeof page.browser === "function" ? page.browser() : page.browser;
-  if (!browser?.pages) return null;
-  const pages = await browser.pages();
-  return pages.find((tab) => tab !== page && onGrow(tab)) || null;
-}
 
 async function reloadGrow(page, pause) {
   log.info("Reloading My Network to recheck an invitation that still shows Connect.");
@@ -535,19 +549,41 @@ async function waitForGrowRender(page, { pause, onHeartbeat }) {
   return { rendered: false };
 }
 
+// A person waits for the Grow cards to paint and looks at them before scrolling.
+export const GROW_SETTLE_MS = [1_500, 4_000];
+
+// Real cards: at least two people and a Connect or Follow control. Two identical samples of
+// an empty or one-link page are not a painted Grow page.
+export function growCardsPainted(ready) {
+  return Boolean(ready?.rendered && (ready.people || 0) >= 2 && (ready.cardControls || 0) >= 1);
+}
+
+export async function settleGrow(page, { pause = sleep, onHeartbeat = () => {}, polls = 12 } = {}) {
+  let previous = null;
+  let ready = null;
+  let painted = false;
+  for (let poll = 0; poll < polls; poll += 1) {
+    ready = await networkDom(page, "growReady").catch(() => null);
+    painted = growCardsPainted(ready) && growCardsPainted(previous)
+      && ready.people === previous.people && ready.cardControls === previous.cardControls;
+    if (painted) break;
+    previous = ready;
+    onHeartbeat();
+    await pause(randomInt(350, 600));
+  }
+  const settleMs = randomInt(...GROW_SETTLE_MS);
+  if (painted) log.info("Grow cards painted. Looking at the page before the first scroll.", { settleMs, people: ready.people, cardControls: ready.cardControls });
+  else log.warn("Grow cards did not finish painting. Proceeding carefully; card checks still gate every press.", { settleMs, people: ready?.people ?? null, cardControls: ready?.cardControls ?? null });
+  onHeartbeat();
+  await pause(settleMs);
+  return ready;
+}
+
 async function openGrow(page, { pause, onHeartbeat = () => {} } = {}) {
   if (onGrow(page)) {
     log.info("Already on My Network Grow; using the open tab.");
     await pause(randomInt(800, 1600));
     return page;
-  }
-  const existing = await existingGrowTab(page);
-  if (existing) {
-    log.info("Switching to an already-open My Network Grow tab.", { url: existing.url() });
-    const { foregroundPage } = await import("../browser/page.js");
-    await foregroundPage(existing, { timeoutMs: 6_000 }).catch(() => {});
-    await pause(randomInt(800, 1600));
-    return existing;
   }
   // Clicks come first: a /mynetwork/grow link already on screen (the feed rail's "Grow your
   // network"), else the My Network nav. Healthy loads of bare /mynetwork redirect to /grow/
@@ -636,22 +672,46 @@ export function pickGrowCandidate(candidates, { state, passed = new Set(), rng =
 
 // Wheel input over the suggestions area only. No "Show more" or other page-wide control is
 // clicked. Returns how far the suggestions scroller moved.
-async function wheelGrow(page, pause, deltaY = randomInt(180, 560)) {
+// A wheel or move that Orbita does not acknowledge would otherwise wait out the 45s
+// protocolTimeout, silently, twice per scroll.
+export const GROW_INPUT_TIMEOUT_MS = 5_000;
+
+function withInputTimeout(promise, timeoutMs, what) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out after ${timeoutMs}ms`)), timeoutMs); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function wheelGrow(page, pause, deltaY = randomInt(180, 560), timeoutMs = GROW_INPUT_TIMEOUT_MS) {
   const target = await networkDom(page, "growWheelTarget").catch(() => null);
   const before = Number.isFinite(target?.scrollTop) ? target.scrollTop : null;
+  let stalled = false;
   if (typeof page.mouse?.wheel === "function") {
     try {
-      if (target && Number.isFinite(target.x) && Number.isFinite(target.y)) await page.mouse.move(target.x, target.y, { steps: randomInt(5, 12) });
-      await page.mouse.wheel({ deltaY });
-    } catch { /* next pass re-inspects */ }
+      if (target && Number.isFinite(target.x) && Number.isFinite(target.y)) await withInputTimeout(page.mouse.move(target.x, target.y, { steps: randomInt(5, 12) }), timeoutMs, "Grow pointer move");
+      await withInputTimeout(page.mouse.wheel({ deltaY }), timeoutMs, "Grow wheel");
+    } catch (error) {
+      stalled = true;
+      log.warn("Grow wheel input did not go through; the next pass re-reads the page.", { message: error.message });
+    }
   }
   await pause(randomInt(1_200, 2_800));
   const after = await networkDom(page, "growScrollTop").catch(() => null);
-  return { target, deltaY, moved: before !== null && Number.isFinite(after) ? Math.abs(after - before) : null };
+  return { target, deltaY, stalled, moved: before !== null && Number.isFinite(after) ? Math.abs(after - before) : null };
 }
 
-async function scrollGrow(page, pause) {
-  await wheelGrow(page, pause);
+async function scrollGrow(page, pause, timeoutMs) {
+  return wheelGrow(page, pause, undefined, timeoutMs);
+}
+
+// One to three suggestion-list scrolls. Invitations are separated by this, not sent in a row.
+export function scrollsBetweenInvites(rng = Math.random) {
+  const roll = rng();
+  if (roll < 0.45) return 1;
+  if (roll < 0.8) return 2;
+  return 3;
 }
 
 async function visitFromGrow(page, state, { pause, signal, onHeartbeat, read, rng }) {
@@ -686,19 +746,49 @@ async function visitFromGrow(page, state, { pause, signal, onHeartbeat, read, rn
   return { page, visited: true };
 }
 
-// My Network Grow phase: optional profile views from cards and 0-4 invitations.
+// The Grow tab is no longer on /mynetwork. A stale handle after a target swap is re-resolved
+// first. Leaving for another LinkedIn page (the account check already ran) or losing the tab
+// ends invitations without a pause when every press this run has a known outcome. The pause
+// stays for an off-LinkedIn page or an invitation whose outcome is still unknown.
+export async function leftMyNetwork(page, state) {
+  const live = await adoptLivePage(page);
+  if (onMyNetwork(live)) {
+    log.info("My Network tab was re-resolved after a target swap; continuing.", { url: safeUrl(live) });
+    return { action: "continue", page: live };
+  }
+  const href = safeUrl(live);
+  const url = parsedUrl(live);
+  const uncertain = Boolean(state?.currentRun && hasUncertainConnect(state, state.currentRun.id));
+  log.warn("Left My Network during Grow.", { url: href, uncertainInvite: uncertain });
+  if (uncertain) return { action: "pause", page: live };
+  if (!url) return { action: "end", page: live, reason: "My Network tab closed during Grow; ending invitations without a pause" };
+  if (["www.linkedin.com", "linkedin.com"].includes(url.hostname)) {
+    return { action: "end", page: live, reason: `Left My Network for ${url.pathname}; ending invitations without a pause` };
+  }
+  return { action: "pause", page: live };
+}
+
+// My Network Grow phase: scroll and send only. No profile views. Session ceiling is 8 invitations.
 // `maxAttempts` is the invitation count for this session (Infinity samples one).
 export async function runConnectionBatch(page, state, {
   signal, onHeartbeat = () => {}, maxDurationMs = 4 * 60_000, maxAttempts = Infinity, growVisits = 0,
   pause = sleep, gapRange = [25_000, 60_000], rng = Math.random, pickCandidate = pickGrowCandidate,
-  readProfile = readProfilePage, shared = undefined,
+  readProfile = readProfilePage, shared = undefined, clock = Date.now, inputTimeoutMs = GROW_INPUT_TIMEOUT_MS,
 } = {}) {
   const result = { connections: 0, attempted: 0, visits: 0, accountBlock: null, reason: null, sent: [] };
+  const finish = (value = result) => {
+    if (value && typeof value === "object") value.page = page;
+    return value;
+  };
   if (state.currentRun?.testRun || state.pause) {
     log.info("Skipping Grow.", { testRun: Boolean(state.currentRun?.testRun), pause: state.pause?.kind || null });
-    return result;
+    return finish();
   }
   if (shared === undefined) { try { shared = loadSharedDay(); } catch { shared = null; } }
+  if (growVisits > 0) {
+    log.info("Ignoring planned profile views. My Network only scrolls and sends invitations.", { ignoredVisits: growVisits });
+  }
+  growVisits = 0;
   if (maxAttempts !== Infinity && (!Number.isInteger(maxAttempts) || maxAttempts < 0)) throw new Error("Invalid connection trial limit");
   const requested = Math.min(maxAttempts === Infinity ? sampleGrowInvites(rng()) : maxAttempts, config.growInviteHardCap);
   let max = config.connectionsEnabled ? requested : 0;
@@ -712,24 +802,25 @@ export async function runConnectionBatch(page, state, {
   }
   if (!max && !growVisits) {
     log.info("Skipping Grow: no invitations or views planned.", { reason: result.reason, requested });
-    return result;
+    return finish();
   }
   log.info("Starting Grow.", { invites: max, requested, growVisits, remaining: budget?.remaining ?? null });
-  const deadline = Date.now() + maxDurationMs;
+  const deadline = clock() + maxDurationMs;
   let block = await inspectAccount(page);
-  if (block) return { ...result, accountBlock: block };
+  if (block) return finish({ ...result, accountBlock: block });
   page = await openGrow(page, { pause, onHeartbeat });
   if (!onGrow(page)) {
     block = await inspectAccount(page);
-    if (block) return { ...result, accountBlock: block };
+    if (block) return finish({ ...result, accountBlock: block });
     log.warn("Grow navigation failed; skipping invitations and Grow views this session without a pause.", { url: safeUrl(page) });
-    return { ...result, reason: GROW_NAV_FAILED };
+    return finish({ ...result, reason: GROW_NAV_FAILED });
   }
+  await settleGrow(page, { pause, onHeartbeat });
   // Views happen before a random invitation slot so they are not always first or last.
   const visitSlots = Array.from({ length: growVisits }, () => Math.floor(rng() * (max + 1))).sort((a, b) => a - b);
   let visitsLeftGrow = false;
   const runVisits = async () => {
-    while (visitSlots.length && visitSlots[0] <= result.attempted && Date.now() < deadline) {
+    while (visitSlots.length && visitSlots[0] <= result.attempted && clock() < deadline) {
       visitSlots.shift();
       if (!onGrow(page)) page = await openGrow(page, { pause, onHeartbeat });
       if (!onGrow(page)) break;
@@ -749,12 +840,23 @@ export async function runConnectionBatch(page, state, {
     }
     return null;
   };
-  const endedAfterVisit = () => ({ ...result, reason: "Could not return to My Network after a profile view" });
+  const endedAfterVisit = () => finish({ ...result, reason: "Could not return to My Network after a profile view" });
   block = await runVisits();
-  if (block) return { ...result, accountBlock: block };
+  if (block) return finish({ ...result, accountBlock: block });
   if (visitsLeftGrow) return endedAfterVisit();
-  if (!max) return result;
+  if (!max) return finish();
   let growNavAttempts = 0;
+  let warmedNetwork = false;
+  const paceScrolls = async () => {
+    const scrolls = scrollsBetweenInvites(rng);
+    log.info("Scrolling My Network.", { scrolls, attempted: result.attempted });
+    for (let i = 0; i < scrolls; i += 1) {
+      onHeartbeat();
+      signal?.throwIfAborted();
+      if (clock() >= deadline) return;
+      await scrollGrow(page, pause, inputTimeoutMs);
+    }
+  };
   const runConnects = state.actions.filter((a) => a.runId === state.currentRun?.id && a.kind === "connect").length;
   const passed = new Set();
   const lookedAt = new Set();
@@ -762,27 +864,40 @@ export async function runConnectionBatch(page, state, {
   let emptyPasses = 0;
   let stuckLayoutPasses = 0;
   let lastLayoutKey = null;
-  while (Date.now() < deadline && result.attempted < max) {
+  while (clock() < deadline && result.attempted < max) {
     onHeartbeat();
     signal?.throwIfAborted();
+    if (deadline - clock() < INVITE_WORK_MS) {
+      log.info("Session time budget reached; sending fewer invitations instead of rushing.", { attempted: result.attempted, planned: max });
+      result.reason ||= "Session time budget reached; fewer invitations sent";
+      break;
+    }
     block = await inspectAccount(page);
-    if (block) return { ...result, accountBlock: block };
+    if (block) return finish({ ...result, accountBlock: block });
     if (/^chrome-error:/i.test(safeUrl(page) || "")) {
       log.warn("My Network tab became a browser error page; ending invitations without a pause.", { url: safeUrl(page) });
-      return { ...result, reason: "Browser error page during Grow" };
+      return finish({ ...result, reason: "Browser error page during Grow" });
     }
-    const url = parsedUrl(page);
-    if (!url || !["www.linkedin.com", "linkedin.com"].includes(url.hostname) || !/^\/mynetwork(?:\/|$)/.test(url.pathname)) {
-      return { ...result, reason: "Unexpected navigation in My Network", accountBlock: { kind: "unexpected_page", reason: "Review unexpected My Network navigation" } };
+    if (!onMyNetwork(page)) {
+      const left = await leftMyNetwork(page, state);
+      page = left.page;
+      if (left.action === "continue") continue;
+      if (left.action === "end") return finish({ ...result, reason: left.reason });
+      return finish({ ...result, reason: "Unexpected navigation in My Network", accountBlock: { kind: "unexpected_page", reason: "Review unexpected My Network navigation" } });
     }
     // Suggestions live on /mynetwork/grow/; cards are never inspected on another tab.
     if (!onGrow(page)) {
       if (growNavAttempts >= 1) {
         log.warn("Grow navigation failed mid-batch; ending invitations without a pause.", { url: safeUrl(page) });
-        return { ...result, reason: GROW_NAV_FAILED };
+        return finish({ ...result, reason: GROW_NAV_FAILED });
       }
       growNavAttempts += 1;
       page = await openGrow(page, { pause, onHeartbeat });
+      continue;
+    }
+    if (!warmedNetwork) {
+      warmedNetwork = true;
+      await paceScrolls();
       continue;
     }
     const candidates = await networkDom(page, "inspect");
@@ -792,7 +907,8 @@ export async function runConnectionBatch(page, state, {
       // Only passed-over cards remain; scroll and let them be reconsidered.
       lookedAt.clear();
       emptyPasses += 1;
-      await scrollGrow(page, pause);
+      log.info("Only passed-over Grow cards are visible. Scrolling so they can be reconsidered.", { emptyPasses, visible: candidates.length, secondsLeft: Math.round((deadline - clock()) / 1000) });
+      await scrollGrow(page, pause, inputTimeoutMs);
       continue;
     }
     if (!candidate) {
@@ -825,7 +941,7 @@ export async function runConnectionBatch(page, state, {
       const toward = reveal?.found && !reveal.visibleNow && Number.isFinite(reveal.delta) && Math.abs(reveal.delta) > 40
         ? Math.sign(reveal.delta) * Math.min(780, Math.max(180, Math.abs(reveal.delta)))
         : randomInt(420, 780);
-      const wheeled = await wheelGrow(page, pause, toward);
+      const wheeled = await wheelGrow(page, pause, toward, inputTimeoutMs);
       log.info("Wheeled the Grow suggestions area.", { deltaY: toward, moved: wheeled.moved, at: wheeled.target ? { x: wheeled.target.x, y: wheeled.target.y } : null });
       if (!wheeled.moved) {
         const scrolled = await networkDom(page, "scrollGrowTowardConnect", { deltaY: toward })
@@ -847,7 +963,7 @@ export async function runConnectionBatch(page, state, {
             ? "Grow suggestion scroller did not advance; no Connect cards became visible"
             : "No unambiguous new connection suggestions found";
         log.warn("Ending connection batch early.", { reason, emptyPasses, stuckLayoutPasses, visible: candidates.length, attempted: result.attempted });
-        return { ...result, reason };
+        return finish({ ...result, reason });
       }
       await pause(randomInt(1500, 2800));
       continue;
@@ -861,9 +977,9 @@ export async function runConnectionBatch(page, state, {
     // Dwell on the card before deciding, as a person reads the headline.
     await pause(randomInt(2500, 5500));
     signal?.throwIfAborted();
-    if (Date.now() >= deadline) break;
+    if (clock() >= deadline) break;
     block = await inspectAccount(page);
-    if (block) return { ...result, accountBlock: block };
+    if (block) return finish({ ...result, accountBlock: block });
     let action = null;
     const click = await checkedClick(page, candidate, "connect", {
       signal, pause, deadline,
@@ -887,7 +1003,7 @@ export async function runConnectionBatch(page, state, {
         result.reason = "Two Connect hit-check misses; ending invitations for this session";
         break;
       }
-      await scrollGrow(page, pause);
+      await scrollGrow(page, pause, inputTimeoutMs);
       continue;
     }
     result.attempted += 1;
@@ -943,13 +1059,17 @@ export async function runConnectionBatch(page, state, {
             page = await reloadGrow(page, pause);
             signal?.throwIfAborted();
             block = await inspectAccount(page);
+            // Reading the cards before Grow re-renders sees an empty list, which is neither
+            // Pending nor Connect. Wait for the cards first; a page that never renders stays uncertain.
+            const rerendered = block ? null : await waitForGrowRender(page, { pause, onHeartbeat });
+            if (rerendered && !rerendered.rendered) log.warn("Grow did not re-render after the recheck reload; the invitation stays unconfirmed.", { name: candidate.name, url: safeUrl(page) });
             if (!block && await networkDom(page, "pending", candidate)) confirmed = true;
             else if (!block && await networkDom(page, "present", candidate)) {
               stillOffered = true;
               recordStillOffered(state, { shared, url: candidate.url });
               saveState(state);
               log.warn("Connect is still offered after reload. Ending invitations and holding them for this profile.", { name: candidate.name, hold: state.inviteHold });
-            } else if (!block) {
+            } else if (!block && rerendered?.rendered) {
               for (let check = 0; check < 6 && !confirmed; check += 1) {
                 if (await networkDom(page, "pending", candidate)) { confirmed = true; break; }
                 const remaining = await networkDom(page, "inspect");
@@ -975,28 +1095,40 @@ export async function runConnectionBatch(page, state, {
     result.sent.push({ name: candidate.name, url: candidate.url, confirmed, ...(notSent ? { notSent: true } : {}) });
     log.info("Connection attempt finished.", { name: candidate.name, url: candidate.url, confirmed, notSent, index: cardIndex, visibleCandidates: candidates.length, attempted: result.attempted, stillOffered, limited, pressMissed });
     if (confirmed) result.connections += 1;
-    if (block) return { ...result, accountBlock: block };
-    if (limited) return { ...result, reason: "Invitation limit notice; invites held until the weekly reset" };
-    if (pressMissed) return { ...result, reason: "Connect press stalled and was not delivered; ending invitations without a pause" };
-    if (stillOffered) return { ...result, reason: "Connect still offered after reload; invites held" };
+    if (block) return finish({ ...result, accountBlock: block });
+    if (limited) return finish({ ...result, reason: "Invitation limit notice; invites held until the weekly reset" });
+    if (pressMissed) return finish({ ...result, reason: "Connect press stalled and was not delivered; ending invitations without a pause" });
+    if (stillOffered) return finish({ ...result, reason: "Connect still offered after reload; invites held" });
     if (!confirmed) {
-      return { ...result, accountBlock: { kind: "uncertain_connection", reason: result.reason || "Connection was not confirmed as pending; inspect invitations before resuming" } };
+      return finish({ ...result, accountBlock: { kind: "uncertain_connection", reason: result.reason || "Connection was not confirmed as pending; inspect invitations before resuming" } });
     }
     if (result.attempted >= max) break;
     block = await runVisits();
-    if (block) return { ...result, accountBlock: block };
+    if (block) return finish({ ...result, accountBlock: block });
     if (visitsLeftGrow) return endedAfterVisit();
+    // The human gap is never shortened to fit the budget: if the next invite would not fit
+    // after a full gap, the batch stops here and sends fewer.
+    const gapMs = randomInt(...gapRange);
+    if (clock() + gapMs + INVITE_WORK_MS > deadline) {
+      log.info("Session time budget reached; sending fewer invitations instead of rushing.", { attempted: result.attempted, planned: max });
+      result.reason ||= "Session time budget reached; fewer invitations sent";
+      break;
+    }
     // Brief pauses during the gap keep cancellation responsive, including after Mac sleep.
-    const nextAt = Math.min(deadline, Date.now() + randomInt(...gapRange));
-    while (Date.now() < nextAt) { onHeartbeat(); signal?.throwIfAborted(); await pause(Math.min(1000, nextAt - Date.now())); }
-    await scrollGrow(page, pause);
+    const nextAt = clock() + gapMs;
+    while (clock() < nextAt) { onHeartbeat(); signal?.throwIfAborted(); await pause(Math.min(1000, nextAt - clock())); }
+    await paceScrolls();
   }
-  if (Date.now() < deadline) {
+  if (result.attempted < max && clock() >= deadline && !result.reason) {
+    log.info("My Network time budget ended before all planned invitations.", { attempted: result.attempted, planned: max });
+    result.reason = "Session time budget reached; fewer invitations sent";
+  }
+  if (clock() < deadline) {
     block = await runVisits();
-    if (block) return { ...result, accountBlock: block };
+    if (block) return finish({ ...result, accountBlock: block });
     if (visitsLeftGrow) return endedAfterVisit();
   }
-  return result;
+  return finish();
 }
 
 // After a stalled Connect press: "pending" or "dialog" means it landed, "offered" means the

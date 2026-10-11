@@ -29,13 +29,10 @@ export const config = {
   allowBlockedDay: envBool("ALLOW_BLOCKED_DAY", false) || argv.includes("--allow-blocked-day"),
   testRun: envBool("TEST_RUN", false) || cliForce,
   connectionTrial: argv.includes("--connection-trial"),
-  // VERIFY_WARMUP=1 (or --verify-warmup) is for one operator verification session only. It
-  // keeps every cap and safety check but forces the plan to include: feed, search with one
-  // person profile read, a company page read, a Follow if a Recommended/Suggested button is
-  // on screen, one exact profile Connect if the top card offers it, and at least one Grow
-  // invite. Search runs first; if it misses, the first feed person profile supplies the
-  // Connect attempt and a company link. Production sessions never set it and keep the random
-  // plan from sampleFlow. Only a one-shot `once` honors it; see resolveVerifyWarmup.
+  // VERIFY_WARMUP=1 (or --verify-warmup) is for one operator verification session only.
+  // It keeps every cap and safety check. It does not open profile or company pages and does
+  // not send connection requests from anywhere except My Network. Only a one-shot `once`
+  // honors it; see resolveVerifyWarmup.
   verifyWarmup: verify.verifyWarmup,
   verifyWarmupIgnored: verify.ignored,
   feedUrl: "https://www.linkedin.com/feed/",
@@ -55,17 +52,10 @@ export const config = {
   connectionWeeklyRanges: [[30, 50], [50, 70], [70, 80], [80, 100]],
   connectionWeekReset: "Monday 00:00 UTC",
   // Grow invites per session: [count, cumulative probability]. Zero is the most common draw.
-  growInviteOdds: [[0, 0.4], [1, 0.62], [2, 0.8], [3, 0.92], [4, 1]],
-  growInviteHardCap: 4,
-  growSkipCardChance: 0.35,
-  // Profile/company page views per session from the feed, home rail, and Grow. Search adds
-  // its own result view on top, so a planned search never uses up these views.
-  visitOdds: [[0, 0.18], [1, 0.6], [2, 0.88], [3, 1]],
-  searchChance: 0.55,
-  searchCompanyChance: 0.3,
-  // Share of searches that may press an exact profile Connect (~1 in 5). Most searches
-  // only read the profile.
-  searchConnectChance: 0.2,
+  // Eight is the ceiling. The tail thins out so a session rarely sends the maximum.
+  growInviteOdds: [[0, 0.28], [1, 0.46], [2, 0.60], [3, 0.72], [4, 0.82], [5, 0.90], [6, 0.95], [7, 0.98], [8, 1]],
+  growInviteHardCap: 8,
+  growSkipCardChance: 0.55,
   // After the session's last invite, stay on LinkedIn this long before the browser closes.
   postInviteDwellMs: { min: 60_000, max: 180_000 },
   // Follow is allowed only for person rows in the home-feed "Recommended for you"
@@ -96,58 +86,45 @@ export function sampleGrowInvites(roll = Math.random()) {
   return Math.min(fromOdds(config.growInviteOdds, roll), config.growInviteHardCap);
 }
 
-// Decides which surfaces this session touches and in what order. The feed always runs;
-// search and Grow are optional and move around it so sessions do not share one script.
+// Feed first. My Network runs only after that, and only when this session drew invitations.
+// Profile pages, company pages, and search are not part of the session.
 export function sampleFlow(rng = Math.random) {
-  const search = rng() < config.searchChance;
-  let rest = fromOdds(config.visitOdds, rng());
   const inviteCount = sampleGrowInvites(rng());
-  const searchCompany = search && rng() < config.searchCompanyChance;
-  let feedVisits = 0;
-  let growVisits = 0;
-  for (; rest > 0; rest -= 1) {
-    if (rng() < 0.6) feedVisits += 1;
-    else growVisits += 1;
-  }
-  const grow = inviteCount > 0 || growVisits > 0;
-  const variants = [];
-  if (search) {
-    variants.push(["search", "feed", ...(grow ? ["grow"] : [])]);
-    variants.push(["feed", "search", ...(grow ? ["grow"] : [])]);
-    if (grow) variants.push(["feed", "grow", "search"]);
-  } else {
-    variants.push(["feed", ...(grow ? ["grow"] : [])]);
-  }
-  const order = variants[Math.min(variants.length - 1, Math.floor(rng() * variants.length))];
   return {
-    order,
-    search,
-    searchCompany,
-    searchConnect: search && rng() < config.searchConnectChance,
+    order: inviteCount > 0 ? ["feed", "grow"] : ["feed"],
+    search: false,
+    searchCompany: false,
+    searchConnect: false,
     inviteCount,
-    feedVisits,
-    growVisits,
+    feedVisits: 0,
+    growVisits: 0,
   };
 }
 
-function testSessionMinutes() {
-  if (!config.testRun) return null;
-  const value = process.env.TEST_SESSION_MINUTES;
+function envSessionMinutes(name) {
+  const value = process.env[name];
   if (value == null || value === "") return null;
   const parts = value.split(",").map((part) => Number.parseInt(part.trim(), 10));
   if (parts.length !== 2 || parts.some((n) => !Number.isInteger(n) || n < 1 || n > 20) || parts[0] > parts[1]) {
-    throw new Error("TEST_SESSION_MINUTES must be two integers min,max between 1 and 20.");
+    throw new Error(`${name} must be two integers min,max between 1 and 20.`);
   }
   return { min: parts[0], max: parts[1] };
 }
 
+// TEST_SESSION_MINUTES applies only to test runs; SESSION_MINUTES overrides production length.
+export function resolveSessionMinutes() {
+  return (config.testRun && envSessionMinutes("TEST_SESSION_MINUTES"))
+    || envSessionMinutes("SESSION_MINUTES")
+    || config.sessionMinutes;
+}
+
 export function sampleSessionPlan() {
-  const minutes = testSessionMinutes() || config.sessionMinutes;
+  const minutes = resolveSessionMinutes();
   return {
     sessionMs: randomInt(minutes.min * 60_000, minutes.max * 60_000),
     likeRate: randomFloat(config.likeRate.min, config.likeRate.max),
     likeCap: config.likeCapPerSession,
-    skipFirstPosts: randomInt(8, 14),
+    skipFirstPosts: randomInt(3, 6),
     warmupMs: randomInt(70_000, 110_000),
     windDownMs: randomInt(35_000, 55_000),
     minMsBetweenLikes: randomInt(95_000, 190_000),
@@ -156,6 +133,9 @@ export function sampleSessionPlan() {
     reverseScrollChance: 0.05,
     expandRate: randomFloat(0.30, 0.40),
     idleChance: randomFloat(0.05, 0.12),
+    postViewChance: randomFloat(0.28, 0.42),
+    videoWatchChance: randomFloat(0.45, 0.7),
+    videoWatchCap: randomInt(1, 2),
     followCap: sampleFollowCap(),
     followRecommended: Math.random() >= config.follow.recommendedSkipChance,
     minMsBetweenFollows: randomInt(120_000, 300_000),
