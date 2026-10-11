@@ -14,6 +14,12 @@ export function completedSessionToday(state, today) {
   });
 }
 
+// WARMUP_ONLY_IDS: comma- or space-separated GoLogin ids. Empty means no filter (null).
+export function parseOnlyIds(value) {
+  const ids = String(value || "").split(/[\s,]+/).filter(Boolean);
+  return ids.length ? new Set(ids) : null;
+}
+
 export function proxyKey(port) {
   if (port == null) return "none";
   const text = String(port).trim();

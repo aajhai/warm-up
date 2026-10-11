@@ -56,6 +56,7 @@ export async function main(args = process.argv.slice(2)) {
       const state = loadState();
       if (command === "pause") state.pause ||= { kind: "operator", reason: option(args, "--reason") || "Paused by operator", at: new Date().toISOString() };
       else {
+        if (profile.retired) throw new Error(`${profile.profileName} is retired (${profile.retired.reason}). It cannot be resumed.`);
         if (!args.includes("--reviewed")) throw new Error("After manually reviewing the account, use resume --reviewed.");
         if (state.pause?.cooldownUntil && Date.now() < new Date(state.pause.cooldownUntil).getTime()) throw new Error(`Challenge cooldown lasts until ${state.pause.cooldownUntil}.`);
         state.pause = null;
@@ -68,6 +69,7 @@ export async function main(args = process.argv.slice(2)) {
     const { auditNetwork } = await import("./networkAudit.js");
     await auditNetwork();
   } else {
+    if (profile.retired) throw new Error(`${profile.profileName} is retired (${profile.retired.reason}). No session runs for a retired profile.`);
     if (!profile.enabled) throw new Error("This profile is disabled in the registry.");
     const { runSession } = await import("./runner.js");
     const result = await runSession({ windowKey: option(args, "--window") });

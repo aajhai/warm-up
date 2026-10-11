@@ -3,6 +3,7 @@
 // in data/profiles.json, and skips paused profiles. The shell picks the next line
 // so the proxy port that just opened a browser is not used again, including across folders.
 // Folder names: WARMUP_FOLDERS (one name per line), else WARMUP_FOLDER, else "Available Profiles".
+// WARMUP_ONLY_IDS (comma-separated ids) narrows the folders to those profiles; every other skip still applies.
 // Usage: node scripts/resolve-available-folder.mjs <queueFile> [--dry-run]
 import "dotenv/config";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -11,7 +12,7 @@ import { writeJsonAtomic } from "../src/util/files.js";
 import { dataDir } from "../src/util/paths.js";
 import { registryPath } from "../src/profiles.js";
 import { istNow } from "../src/util/time.js";
-import { completedSessionToday, formatQueue, orderByProxy } from "./proxy-queue.mjs";
+import { completedSessionToday, formatQueue, orderByProxy, parseOnlyIds } from "./proxy-queue.mjs";
 
 const API_URL = "https://api.gologin.com";
 
@@ -120,9 +121,17 @@ const registry = existsSync(registryPath)
   : { version: 1, profiles: [] };
 if (registry.version !== 1 || !Array.isArray(registry.profiles)) fail("data/profiles.json is not a version 1 registry.");
 
+const onlyIds = parseOnlyIds(process.env.WARMUP_ONLY_IDS);
+if (onlyIds) {
+  const missing = [...onlyIds].filter((id) => !seen.has(id));
+  console.log(`resolve: WARMUP_ONLY_IDS keeps ${onlyIds.size - missing.length} of ${ids.length} folder profile(s).`);
+  if (missing.length) console.log(`WARN WARMUP_ONLY_IDS not in the requested folders, ignored: ${missing.join(", ")}`);
+}
+
 const queue = [];
 const added = [];
 for (const id of ids) {
+  if (onlyIds && !onlyIds.has(id)) continue;
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) { console.log(`SKIP ${id}: invalid GoLogin id`); continue; }
   let remote = listed.get(id);
   if (!remote) {
@@ -140,6 +149,7 @@ for (const id of ids) {
     registry.profiles.push(entry);
     added.push(entry);
   }
+  if (entry.retired) { console.log(`SKIP ${entry.profileName}: retired (${entry.retired.reason || "no reason"})`); continue; }
   if (!entry.enabled) { console.log(`SKIP ${entry.profileName}: disabled in data/profiles.json`); continue; }
   const pause = pauseOf(id);
   if (pause) { console.log(`SKIP ${entry.profileName}: paused (${pause})`); continue; }

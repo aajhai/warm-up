@@ -13,6 +13,7 @@
 #   bash scripts/run-available-folder.sh --folder Harvest --folder "Available Profiles"
 #   bash scripts/run-available-folder.sh --dry-run --folder Harvest
 #   WARMUP_LAST_PORT=5004 bash scripts/run-available-folder.sh
+#   WARMUP_ONLY_IDS=<id>,<id> bash scripts/run-available-folder.sh --folder Harvest   only those profiles
 # WARMUP_LAST_PORT is the proxy port that just opened a browser, so the first
 # profile in this batch is not started on that same port.
 set -u

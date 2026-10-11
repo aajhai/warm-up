@@ -1,6 +1,7 @@
 import puppeteer from "puppeteer-core";
 import { execFileSync } from "node:child_process";
 import { config } from "../config.js";
+import { assertNotRetired } from "../profiles.js";
 import { createGoLoginClient } from "../gologin/client.js";
 import { createLogger } from "../logger.js";
 import { sleep } from "../util/random.js";
@@ -102,6 +103,7 @@ function assertProfileLock(profile) {
 }
 
 export async function openWarmupBrowser() {
+  assertNotRetired(config.profileId);
   const gologin = await createGoLoginClient();
   let profile;
   try {
