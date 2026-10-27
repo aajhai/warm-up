@@ -48,7 +48,8 @@ else
 fi
 
 export GOLOGIN_BROWSER_MODE=local
-export SESSION_MINUTES=5,10
+# Caller can set SESSION_MINUTES (min,max, 1–20). Default stays 5–10.
+export SESSION_MINUTES="${SESSION_MINUTES:-5,10}"
 export TEST_RUN=0
 export VERIFY_WARMUP=0
 unset TEST_SESSION_MINUTES
